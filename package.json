@@ -1,0 +1,41 @@
+{
+  "name": "claude-kanban",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local kanban board where each card spins up multi-repo git worktrees with an interactive Claude Code session in a node-pty terminal.",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"tsx watch src/server/index.ts\" \"vite -c web/vite.config.ts\"",
+    "server": "tsx src/server/index.ts",
+    "build": "vite build -c web/vite.config.ts && tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@xterm/addon-attach": "^0.11.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2",
+    "nanoid": "^5.1.5",
+    "node-pty": "^1.0.0",
+    "pinia": "^2.3.1",
+    "vue": "^3.5.16",
+    "vue-router": "^4.5.1",
+    "vuedraggable": "^4.1.0",
+    "ws": "^8.18.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.19.0",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^2.2.10"
+  }
+}
