@@ -20,6 +20,8 @@ import type {
   FsInspectResponse,
   CommandKind,
   RunCommandResult,
+  DbOverviewResponse,
+  DbTableRowsResponse,
 } from "@shared/types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
@@ -102,6 +104,12 @@ export interface ApiClient {
     opts?: { includeFiles?: boolean },
   ): Promise<FsListResponse>;
   fsInspect(path: string): Promise<FsInspectResponse>;
+  // Live DB viewer (read-only)
+  dbOverview(): Promise<DbOverviewResponse>;
+  dbTableRows(
+    table: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<DbTableRowsResponse>;
 }
 
 class FetchApiClient implements ApiClient {
@@ -239,6 +247,25 @@ class FetchApiClient implements ApiClient {
   fsInspect(path: string): Promise<FsInspectResponse> {
     return request<FsInspectResponse>(
       `/api/fs/inspect?path=${encodeURIComponent(path)}`,
+    );
+  }
+
+  /* ── Live DB viewer ───────────────────────────────────────────────── */
+
+  dbOverview(): Promise<DbOverviewResponse> {
+    return request<DbOverviewResponse>("/api/db");
+  }
+
+  dbTableRows(
+    table: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<DbTableRowsResponse> {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return request<DbTableRowsResponse>(
+      `/api/db/tables/${encodeURIComponent(table)}/rows${qs ? `?${qs}` : ""}`,
     );
   }
 }

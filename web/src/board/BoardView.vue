@@ -89,6 +89,13 @@ function openTaskModal(): void {
           </button>
         </div>
 
+        <RouterLink
+          class="btn btn--ghost"
+          to="/db"
+          title="Ver la base de datos en vivo"
+        >
+          ⛁ BD
+        </RouterLink>
         <button class="btn btn--ghost" type="button" @click="newProject">
           + Proyecto
         </button>
@@ -258,10 +265,13 @@ function openTaskModal(): void {
 }
 
 .btn {
+  display: inline-flex;
+  align-items: center;
   padding: 8px 15px;
   border-radius: var(--ck-radius);
   font-weight: 600;
   border: 1px solid transparent;
+  text-decoration: none; /* .btn is also applied to RouterLink anchors */
   transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
 }
 .btn--primary {

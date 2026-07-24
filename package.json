@@ -9,7 +9,8 @@
     "server": "tsx src/server/index.ts",
     "build": "vite build -c web/vite.config.ts && tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "dbviz": "bash scripts/dbviz/dbviz.sh"
   },
   "dependencies": {
     "@xterm/addon-attach": "^0.11.0",

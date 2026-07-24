@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://dbviz.local/dbviz.config.schema.json",
+  "title": "dbviz.config.json",
+  "description": "Config editable de dbviz (SPEC §3). Informativo: dbviz.py valida a mano por robustez, este schema documenta la forma esperada y puede usarse con validadores externos.",
+  "type": "object",
+  "required": ["configVersion", "projectName", "scan", "sources", "extraction", "remote", "output", "viewer"],
+  "properties": {
+    "configVersion": { "const": 1 },
+    "projectName": { "type": "string" },
+    "generatedBy": { "type": "string" },
+    "scan": {
+      "type": "object",
+      "properties": {
+        "roots": { "type": "array", "items": { "type": "string" }, "default": ["."] },
+        "exclude": { "type": "array", "items": { "type": "string" } },
+        "include": { "type": "array", "items": { "type": "string" } },
+        "followSymlinks": { "type": "boolean", "default": false },
+        "maxDepth": { "type": "integer", "minimum": 1, "default": 8 },
+        "maxFileSizeMB": { "type": "integer", "minimum": 1, "default": 2048 }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "enabled"],
+        "properties": {
+          "id": { "type": "string" },
+          "path": { "type": ["string", "null"] },
+          "kind": {
+            "type": "string",
+            "enum": ["sqlite", "json", "ndjson", "csv", "tsv", "orm-schema", "remote-config", "duckdb"]
+          },
+          "enabled": { "type": "boolean" },
+          "label": { "type": "string" },
+          "detectedBy": {
+            "type": "string",
+            "enum": ["magic-bytes", "extension", "orm-file", "config-file", "manual", "unknown"]
+          },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "extraction": {
+      "type": "object",
+      "properties": {
+        "engine": { "type": "string", "enum": ["auto", "python", "sqlite3", "node", "duckdb"], "default": "auto" },
+        "maxRowsPerTable": { "type": "integer", "minimum": 1, "default": 5000 },
+        "sampleStrategy": { "type": "string", "enum": ["full", "head", "random", "systematic"], "default": "systematic" },
+        "maxBlobInlineBytes": { "type": "integer", "minimum": 0, "default": 4096 },
+        "maxCellChars": { "type": "integer", "minimum": 1, "default": 20000 },
+        "mergeWal": { "type": "boolean", "default": true },
+        "copyBeforeRead": { "type": "boolean", "const": true, "default": true }
+      }
+    },
+    "remote": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "detectOnly": { "type": "boolean", "default": true }
+      }
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "dir": { "type": "string", "default": ".dbviz" },
+        "singleFile": { "type": "boolean", "default": true },
+        "inlineAssets": { "type": "boolean", "default": true },
+        "writeRawJson": { "type": "boolean", "default": true }
+      }
+    },
+    "viewer": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "theme": { "type": "string", "enum": ["auto", "light", "dark"], "default": "auto" },
+        "erDiagram": { "type": "boolean", "default": true },
+        "charts": { "type": "boolean", "default": true },
+        "defaultTab": { "type": "string", "enum": ["tables", "schema", "stats"], "default": "tables" }
+      }
+    }
+  }
+}
