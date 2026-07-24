@@ -13,6 +13,7 @@ import express, { Router, json } from "express";
 import type { ErrorRequestHandler, Request, Response } from "express";
 import type {
   CommandRunnerService,
+  DbViewerService,
   FsBrowserService,
   PtyService,
   Repositories,
@@ -23,6 +24,7 @@ import { createTasksRouter } from "./tasks.js";
 import { createCommandsRouter } from "./commands.js";
 import { createFsRouter } from "./fs.js";
 import { createAgentEventsRouter } from "./agent-events.js";
+import { createDbRouter } from "./db.js";
 
 export type { BoardEventEmitter } from "./projects.js";
 
@@ -45,6 +47,11 @@ export interface ApiDeps {
   commandRunner?: CommandRunnerService;
   /** Optional board-event broadcaster, wired by the server bootstrap. */
   emit?: BoardEventEmitter;
+  /**
+   * Read-only live DB viewer backing the `/db` route. Optional so isolated
+   * tests can omit it; the /db routes are only mounted when present.
+   */
+  dbViewer?: DbViewerService;
 }
 
 /**
@@ -103,6 +110,9 @@ export function createApiRouter(deps: ApiDeps): Router {
     }),
   );
   router.use("/fs", createFsRouter({ fsBrowser: deps.fsBrowser }));
+  if (deps.dbViewer) {
+    router.use("/db", createDbRouter({ viewer: deps.dbViewer }));
+  }
 
   const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     /* Surface a JSON parse failure from express.json() as a 400. */

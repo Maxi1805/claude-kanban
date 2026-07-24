@@ -397,8 +397,19 @@ export interface BoardEventMsg {
   project?: Project;
 }
 
+/**
+ * Server → client: the sqlite database changed (any table, any writer — the
+ * app itself or an external process). Broadcast on `/ws/events` so the live DB
+ * viewer refetches. `dataVersion` is sqlite's `PRAGMA data_version` as seen by
+ * the viewer's read-only connection; it strictly increases across changes.
+ */
+export interface DbChangedMsg {
+  type: "db:changed";
+  dataVersion: number;
+}
+
 /** Any message that can travel over the websocket layer. */
-export type WSMessage = PtyMessage | CmdMessage | BoardEventMsg;
+export type WSMessage = PtyMessage | CmdMessage | BoardEventMsg | DbChangedMsg;
 
 /* Back-compat aliases (the `*Msg` names above are canonical). */
 /** @deprecated use {@link PtyOutputMsg}. */
@@ -487,6 +498,73 @@ export interface FsInspectResponse {
   branches: string[];
   /** Immediate child dirs that are git repos (for multi-repo discovery). */
   childGitRepos: FsEntry[];
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Live DB viewer (read-only inspection of the app's own sqlite database)
+ *
+ * Powers the `/db` route: a live view of the database that refreshes when the
+ * server broadcasts `db:changed`. Everything is derived generically from
+ * sqlite_master + pragmas — no table names are assumed — so the viewer keeps
+ * working as the schema evolves.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** One column of a table, from `pragma_table_info`. */
+export interface DbColumn {
+  name: string;
+  /** Declared type as written in the DDL (may be ""). */
+  type: string;
+  notNull: boolean;
+  primaryKey: boolean;
+  /** Default value expression as text, null when none. */
+  defaultValue: string | null;
+}
+
+/** One outgoing foreign key of a table, from `pragma_foreign_key_list`. */
+export interface DbForeignKey {
+  /** Referencing column in this table. */
+  from: string;
+  /** Referenced table. */
+  toTable: string;
+  /** Referenced column; null when the FK targets the parent's primary key. */
+  toColumn: string | null;
+}
+
+/** Structure + live row count of one user table. */
+export interface DbTableInfo {
+  name: string;
+  rowCount: number;
+  columns: DbColumn[];
+  foreignKeys: DbForeignKey[];
+  /** Original CREATE TABLE statement, null if unavailable. */
+  ddl: string | null;
+}
+
+/** Response for GET /api/db — the whole database at a glance. */
+export interface DbOverviewResponse {
+  /** Absolute path of the sqlite file being viewed. */
+  path: string;
+  /** `PRAGMA data_version` at read time (pairs with {@link DbChangedMsg}). */
+  dataVersion: number;
+  tables: DbTableInfo[];
+}
+
+/**
+ * A single cell as serialized over JSON. BLOBs are replaced server-side with a
+ * `[BLOB n bytes]` placeholder string; everything else passes through.
+ */
+export type DbCellValue = string | number | null;
+
+/** Response for GET /api/db/tables/:name/rows — one page of a table. */
+export interface DbTableRowsResponse {
+  table: string;
+  /** Total rows in the table (page-independent). */
+  total: number;
+  limit: number;
+  offset: number;
+  /** Column names, in SELECT order — every row array aligns with this. */
+  columns: string[];
+  rows: DbCellValue[][];
 }
 
 /* ────────────────────────────────────────────────────────────────────────

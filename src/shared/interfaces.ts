@@ -12,6 +12,8 @@ import type {
   CommandKind,
   CreateProjectDTO,
   CreateTaskDTO,
+  DbOverviewResponse,
+  DbTableRowsResponse,
   FsInspectResponse,
   FsListResponse,
   FsRootsResponse,
@@ -503,6 +505,54 @@ export interface TaskLifecycle {
    * Returns false when no project with that id exists (nothing torn down).
    */
   deleteProject(projectId: string): Promise<boolean>;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * DbViewerService — read-only live inspection of the app's sqlite database.
+ *   Owner module: db-viewer
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** Raised for an unknown table name (the router maps it to a 404). */
+export class DbViewerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DbViewerError";
+  }
+}
+
+/**
+ * Read-only window onto the app's own sqlite file for the `/db` live viewer.
+ * Backed by a SEPARATE read-only connection (never the app's writer), which is
+ * also what makes change detection work: `PRAGMA data_version` only moves when
+ * ANOTHER connection commits, so from this connection's viewpoint every app
+ * write (and any external writer) bumps it. Everything is introspected via
+ * sqlite_master + pragma table functions — no schema assumptions.
+ */
+export interface DbViewerService {
+  /** Schema + row counts of every user table (sqlite_* internals excluded). */
+  overview(): DbOverviewResponse;
+
+  /**
+   * One page of a table's rows. `name` must be an existing user table (checked
+   * against sqlite_master — never interpolated unvalidated) or
+   * {@link DbViewerError} is thrown. `limit` is clamped to a sane maximum.
+   */
+  tableRows(
+    name: string,
+    opts?: { limit?: number; offset?: number },
+  ): DbTableRowsResponse;
+
+  /**
+   * Start polling `PRAGMA data_version` and broadcasting a `db:changed` frame
+   * whenever it moved. Idempotent; the interval never holds the process open.
+   */
+  start(): void;
+
+  /** Stop polling (idempotent). */
+  stop(): void;
+
+  /** Close the underlying read-only connection (stops polling first). */
+  close(): void;
 }
 
 /* ────────────────────────────────────────────────────────────────────────

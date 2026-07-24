@@ -29,6 +29,7 @@ import { CommandRunnerServiceImpl } from "./services/command-runner.js";
 import { FsBrowserServiceImpl } from "./services/fs-browser.js";
 import { TaskLifecycleImpl } from "./lifecycle/task-lifecycle.js";
 import { AgentActivityMonitor } from "./services/agent-activity-monitor.js";
+import { DbViewerServiceImpl } from "./services/db-viewer.js";
 import { createApiRouter, type BoardEventEmitter } from "./api/index.js";
 import { setup as setupPtyBridge } from "./ws/pty-bridge.js";
 import { setup as setupCmdBridge } from "./ws/cmd-bridge.js";
@@ -74,6 +75,14 @@ export async function main(): Promise<void> {
   // Read-only filesystem browser backing the repo picker (local-only).
   const fsBrowser = new FsBrowserServiceImpl(config);
 
+  // Live DB viewer: a SEPARATE read-only connection onto the same sqlite file
+  // (so app writes bump its `data_version`), polled to broadcast `db:changed`
+  // frames on the events channel. Powers the `/db` route.
+  const dbViewer = new DbViewerServiceImpl({
+    dbPath: config.dbPath,
+    broadcast: (msg) => eventsHub.broadcast(msg),
+  });
+
   // Owns the "waiting" half of agent state: demotes a "working" task to "waiting"
   // once its pty output goes quiet. Promotion to "working" is hook-driven (see
   // api/agent-events.ts), so merely viewing/redrawing a terminal never promotes.
@@ -108,6 +117,7 @@ export async function main(): Promise<void> {
       pty,
       commandRunner,
       emit,
+      dbViewer,
     }),
   );
 
@@ -152,6 +162,9 @@ export async function main(): Promise<void> {
 
   // Start demoting quiet "working" tasks to "waiting" (promotion stays hook-driven).
   activityMonitor.start();
+
+  // Start watching the sqlite file for commits so the /db viewer stays live.
+  dbViewer.start();
 
   // Reclaim worktrees/branches left behind by tasks that were torn down
   // uncleanly (e.g. a crash). Best-effort: never block startup on it.
