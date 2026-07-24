@@ -7,3 +7,9 @@ dist/
 *.db-wal
 *.log
 .DS_Store
+
+# dbviz (scripts/dbviz) — config editable localmente y visor generado
+dbviz.config.json
+.dbviz/
+scripts/dbviz/__pycache__/
+scripts/dbviz/lib/__pycache__/

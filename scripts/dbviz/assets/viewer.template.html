@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>{{TITLE}}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{CSS}}
+</head>
+<body>
+<div id="dbviz-root">
+  <header id="dbviz-header">
+    <div class="dbviz-header-left">
+      <span class="dbviz-logo">dbviz</span>
+      <span id="dbviz-project-name" class="dbviz-project-name"></span>
+    </div>
+    <div class="dbviz-header-right">
+      <select id="dbviz-source-select" title="Fuente de datos"></select>
+      <button id="dbviz-theme-toggle" title="Cambiar tema" type="button">🌓</button>
+    </div>
+  </header>
+
+  <nav id="dbviz-tabs">
+    <button class="dbviz-tab-btn" data-tab="tables">Tablas</button>
+    <button class="dbviz-tab-btn" data-tab="schema">Esquema</button>
+    <button class="dbviz-tab-btn" data-tab="stats">Stats</button>
+    <button class="dbviz-tab-btn" data-tab="about">Acerca de</button>
+  </nav>
+
+  <main id="dbviz-main">
+    <section id="dbviz-panel-tables" class="dbviz-panel">
+      <div class="dbviz-tables-layout">
+        <aside id="dbviz-table-list" class="dbviz-table-list"></aside>
+        <div class="dbviz-table-view">
+          <div id="dbviz-sample-banner" class="dbviz-banner dbviz-banner-warn" hidden></div>
+          <div id="dbviz-source-error" class="dbviz-banner dbviz-banner-error" hidden></div>
+          <div id="dbviz-table-title" class="dbviz-table-title"></div>
+          <div id="dbviz-grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="dbviz-panel-schema" class="dbviz-panel" hidden>
+      <div id="dbviz-schema-container"></div>
+    </section>
+
+    <section id="dbviz-panel-stats" class="dbviz-panel" hidden>
+      <div id="dbviz-stats-container" class="dbviz-stats-grid"></div>
+    </section>
+
+    <section id="dbviz-panel-about" class="dbviz-panel" hidden>
+      <div id="dbviz-about-container" class="dbviz-about"></div>
+    </section>
+  </main>
+
+  <footer id="dbviz-footer"></footer>
+</div>
+
+{{DATA}}
+{{CFG}}
+{{LIBS}}
+{{APP}}
+</body>
+</html>
