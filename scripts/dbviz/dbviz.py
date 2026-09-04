@@ -65,6 +65,12 @@ class IOWriteError(Exception):
     exit_code = 5
 
 
+# Excepciones de control de flujo que main() mapea igual: loguea a stderr y
+# devuelve exit_code. UsageError se maneja también aparte en el parseo de args
+# (donde el error ya se imprimió y no se re-loguea).
+_EXIT_ERRORS = (UsageError, EngineError, ConfigError, NoExtractableError, IOWriteError)
+
+
 # ---------------------------------------------------------------------------
 # Config: defaults, merge, validación (SPEC §3)
 # ---------------------------------------------------------------------------
@@ -252,66 +258,70 @@ def extract_one_source(candidate_cfg: dict, cfg: dict, tmpdir: str, engine_name:
     source = contract.new_source(id_, kind, abspath, label, detected_by, confidence)
 
     if kind == "sqlite":
-        if not abspath or not os.path.isfile(abspath):
-            source["error"] = "archivo no encontrado"
-            source["extractedAt"] = util.iso_now()
-            return source
-        forced = ENGINE_SHORT.get(engine_name, "auto") if cfg["extraction"]["engine"] == "auto" else cfg["extraction"]["engine"]
-        return extract_sqlite.extract_sqlite(source, cfg, tmpdir, forced_engine=forced)
-
+        return _extract_sqlite_source(source, abspath, cfg, tmpdir, engine_name)
     if kind in ("json", "ndjson", "csv", "tsv"):
-        if not abspath or not os.path.isfile(abspath):
-            source["error"] = "archivo no encontrado"
-            source["extractedAt"] = util.iso_now()
-            return source
-        try:
-            source["sizeBytes"] = os.path.getsize(abspath)
-        except OSError:
-            source["sizeBytes"] = None
-        try:
-            if kind == "json":
-                tables = extract_files.extract_json(abspath, cfg)
-                warns = []
-            elif kind == "ndjson":
-                tables, warns = extract_files.extract_ndjson(abspath, cfg)
-            else:
-                delim = "\t" if kind == "tsv" else None
-                tables, warns = extract_files.extract_csv(abspath, cfg, delimiter=delim)
-            source["tables"] = tables
-            source["warnings"].extend(warns)
-            source["hasData"] = True
-            source["engineUsed"] = "python-stdlib"
-        except ValueError as e:
-            source["warnings"].append(util.W("W-JSON-NONTABULAR", str(e)))
-            source["hasData"] = False
-        except OSError as e:
-            source["error"] = f"error de I/O: {e}"
-            source["hasData"] = False
-        source["extractedAt"] = util.iso_now()
-        return source
+        return _extract_tabular_source(source, abspath, kind, cfg)
+    return _extract_unsupported_source(source, kind)
 
+
+def _mark_missing_file(source: dict) -> dict:
+    source["error"] = "archivo no encontrado"
+    source["extractedAt"] = util.iso_now()
+    return source
+
+
+def _extract_sqlite_source(source: dict, abspath: str | None, cfg: dict, tmpdir: str, engine_name: str) -> dict:
+    if not abspath or not os.path.isfile(abspath):
+        return _mark_missing_file(source)
+    engine_cfg = cfg["extraction"]["engine"]
+    forced = ENGINE_SHORT.get(engine_name, "auto") if engine_cfg == "auto" else engine_cfg
+    return extract_sqlite.extract_sqlite(source, cfg, tmpdir, forced_engine=forced)
+
+
+def _extract_tabular_source(source: dict, abspath: str | None, kind: str, cfg: dict) -> dict:
+    if not abspath or not os.path.isfile(abspath):
+        return _mark_missing_file(source)
+    try:
+        source["sizeBytes"] = os.path.getsize(abspath)
+    except OSError:
+        source["sizeBytes"] = None
+    try:
+        if kind == "json":
+            tables = extract_files.extract_json(abspath, cfg)
+            warns = []
+        elif kind == "ndjson":
+            tables, warns = extract_files.extract_ndjson(abspath, cfg)
+        else:
+            delim = "\t" if kind == "tsv" else None
+            tables, warns = extract_files.extract_csv(abspath, cfg, delimiter=delim)
+        source["tables"] = tables
+        source["warnings"].extend(warns)
+        source["hasData"] = True
+        source["engineUsed"] = "python-stdlib"
+    except ValueError as e:
+        source["warnings"].append(util.W("W-JSON-NONTABULAR", str(e)))
+        source["hasData"] = False
+    except OSError as e:
+        source["error"] = f"error de I/O: {e}"
+        source["hasData"] = False
+    source["extractedAt"] = util.iso_now()
+    return source
+
+
+def _extract_unsupported_source(source: dict, kind: str) -> dict:
+    """Kinds detectados pero sin extracción de filas en v1: fijan error/warning
+    y hasData=False (duckdb, orm-schema, remote-config y cualquier kind ajeno)."""
     if kind == "duckdb":
         source["error"] = "DuckDB detectado pero no soportado en v1 (extensión futura, ver docs/research-extract.md §3)"
-        source["hasData"] = False
-        source["extractedAt"] = util.iso_now()
-        return source
-
-    if kind == "orm-schema":
+    elif kind == "orm-schema":
         source["error"] = None
-        source["hasData"] = False
         source["warnings"].append(util.W("W-ORM-NO-DATA", "schema de ORM detectado: solo estructura, sin filas (v1 no lo parsea a tablas)"))
-        source["extractedAt"] = util.iso_now()
-        return source
-
-    if kind == "remote-config":
+    elif kind == "remote-config":
         source["error"] = None
-        source["hasData"] = False
         source["path"] = None
         source["warnings"].append(util.W("W-REMOTE-NOT-SUPPORTED", "BD remota (Postgres/MySQL) detectada: extracción remota no soportada en v1"))
-        source["extractedAt"] = util.iso_now()
-        return source
-
-    source["error"] = f"kind desconocido: {kind}"
+    else:
+        source["error"] = f"kind desconocido: {kind}"
     source["hasData"] = False
     source["extractedAt"] = util.iso_now()
     return source
@@ -395,74 +405,27 @@ def cmd_build(args) -> int:
     project_root = os.path.abspath(args.project or os.getcwd())
     config_path = args.config or os.path.join(project_root, "dbviz.config.json")
 
-    global_warnings: list[dict] = []
-    if os.path.exists(config_path):
-        cfg, warns = load_config(config_path, project_root)
-        global_warnings.extend(warns)
-    else:
-        cfg = default_config(project_root)
-        util.log("no se encontró dbviz.config.json; usando auto-init en memoria con defaults")
-        global_warnings.append(util.W("W-AUTO-INIT", "no se encontró dbviz.config.json; se usó auto-init en memoria con defaults"))
-        candidates = detect_mod.detect(project_root, cfg)
-        cfg["sources"] = candidates_to_config_sources(candidates)
-
-    # Overrides de CLI (SPEC §3 "Reglas de merge": no reescriben el archivo)
-    if args.engine:
-        cfg["extraction"]["engine"] = args.engine
-    if args.max_rows is not None:
-        cfg["extraction"]["maxRowsPerTable"] = args.max_rows
-    if args.sample:
-        cfg["extraction"]["sampleStrategy"] = args.sample
-    if args.out:
-        cfg["output"]["dir"] = args.out
+    cfg, global_warnings = _load_build_config(args, project_root, config_path)
+    _apply_cli_overrides(cfg, args)
 
     engine_info = resolve_engine(cfg["extraction"]["engine"])
     util.log(f"engine={engine_info['name']} sqlite={engine_info['sqliteLib']}")
 
     output_dir = os.path.abspath(os.path.join(project_root, cfg["output"]["dir"]))
+    sources_cfg = _select_sources(cfg, args)
 
-    sources_cfg = cfg["sources"]
-    if args.source:
-        wanted = set(args.source)
-        sources_cfg = [s for s in sources_cfg if s.get("path") in wanted]
-
+    # El tmpdir de copias RO es propiedad del build: se crea acá y se limpia
+    # siempre (salvo --keep-temp), aunque la extracción falle.
     tmpdir = tempfile.mkdtemp(prefix="dbviz-")
-    extracted_sources: list[dict] = []
     try:
-        for s in sources_cfg:
-            if not s.get("enabled", True):
-                continue
-            s = dict(s)
-            s["__project_root__"] = project_root
-            util.log(f"{s['id']} {s.get('path') or '(sin archivo)'}: extrayendo ({s['kind']}) ...")
-            result = extract_one_source(s, cfg, tmpdir, engine_info["name"])
-            extracted_sources.append(result)
-            if result.get("error"):
-                util.log(f"{s['id']}: error -> {result['error']}")
-            else:
-                n_tables = len(result.get("tables", []))
-                n_rows = sum(t.get("rowCountSample") or 0 for t in result.get("tables", []))
-                n_sampled = sum(1 for t in result.get("tables", []) if t.get("sampled"))
-                util.log(f"{s['id']} {n_tables} tablas, {n_rows} filas ({n_sampled} muestreadas)")
+        extracted_sources = _extract_sources(sources_cfg, cfg, engine_info, project_root, tmpdir)
     finally:
-        if not args.keep_temp:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        else:
+        if args.keep_temp:
             util.log(f"copias temporales conservadas en {tmpdir} (--keep-temp)")
+        else:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-    config_echo = {
-        "maxRowsPerTable": cfg["extraction"]["maxRowsPerTable"],
-        "sampleStrategy": cfg["extraction"]["sampleStrategy"],
-    }
-    manifest = contract.build_manifest(
-        project_name=cfg.get("projectName", os.path.basename(project_root)),
-        project_root=project_root,
-        engine_info=engine_info,
-        config_echo=config_echo,
-        sources=extracted_sources,
-        global_warnings=global_warnings,
-        tool_version=TOOL_VERSION,
-    )
+    manifest = _build_manifest(cfg, project_root, engine_info, extracted_sources, global_warnings)
 
     any_data = any(s.get("hasData") for s in extracted_sources)
     if not any_data and args.strict:
@@ -474,13 +437,106 @@ def cmd_build(args) -> int:
     return 0
 
 
+def _load_build_config(args, project_root: str, config_path: str) -> tuple[dict, list[dict]]:
+    """Carga dbviz.config.json si existe; si no, auto-init en memoria con
+    defaults + detección de fuentes (SPEC §3). Devuelve (cfg, global_warnings)."""
+    global_warnings: list[dict] = []
+    if os.path.exists(config_path):
+        cfg, warns = load_config(config_path, project_root)
+        global_warnings.extend(warns)
+    else:
+        cfg = default_config(project_root)
+        util.log("no se encontró dbviz.config.json; usando auto-init en memoria con defaults")
+        global_warnings.append(util.W("W-AUTO-INIT", "no se encontró dbviz.config.json; se usó auto-init en memoria con defaults"))
+        candidates = detect_mod.detect(project_root, cfg)
+        cfg["sources"] = candidates_to_config_sources(candidates)
+    return cfg, global_warnings
+
+
+def _apply_cli_overrides(cfg: dict, args) -> None:
+    """Overrides de CLI (SPEC §3 "Reglas de merge": no reescriben el archivo)."""
+    if args.engine:
+        cfg["extraction"]["engine"] = args.engine
+    if args.max_rows is not None:
+        cfg["extraction"]["maxRowsPerTable"] = args.max_rows
+    if args.sample:
+        cfg["extraction"]["sampleStrategy"] = args.sample
+    if args.out:
+        cfg["output"]["dir"] = args.out
+
+
+def _select_sources(cfg: dict, args) -> list[dict]:
+    """Aplica el filtro --source (restringe el build a esas rutas)."""
+    sources_cfg = cfg["sources"]
+    if args.source:
+        wanted = set(args.source)
+        sources_cfg = [s for s in sources_cfg if s.get("path") in wanted]
+    return sources_cfg
+
+
+def _extract_sources(sources_cfg: list[dict], cfg: dict, engine_info: dict, project_root: str, tmpdir: str) -> list[dict]:
+    """Extrae cada fuente habilitada usando `tmpdir` para las copias RO.
+    Devuelve las fuentes extraídas (la limpieza del tmpdir es del llamador)."""
+    extracted_sources: list[dict] = []
+    for s in sources_cfg:
+        if not s.get("enabled", True):
+            continue
+        s = dict(s)
+        s["__project_root__"] = project_root
+        util.log(f"{s['id']} {s.get('path') or '(sin archivo)'}: extrayendo ({s['kind']}) ...")
+        result = extract_one_source(s, cfg, tmpdir, engine_info["name"])
+        extracted_sources.append(result)
+        _log_extraction_result(s, result)
+    return extracted_sources
+
+
+def _log_extraction_result(s: dict, result: dict) -> None:
+    if result.get("error"):
+        util.log(f"{s['id']}: error -> {result['error']}")
+        return
+    tables = result.get("tables", [])
+    n_tables = len(tables)
+    n_rows = sum(t.get("rowCountSample") or 0 for t in tables)
+    n_sampled = sum(1 for t in tables if t.get("sampled"))
+    util.log(f"{s['id']} {n_tables} tablas, {n_rows} filas ({n_sampled} muestreadas)")
+
+
+def _build_manifest(cfg: dict, project_root: str, engine_info: dict, extracted_sources: list[dict], global_warnings: list[dict]) -> dict:
+    config_echo = {
+        "maxRowsPerTable": cfg["extraction"]["maxRowsPerTable"],
+        "sampleStrategy": cfg["extraction"]["sampleStrategy"],
+    }
+    return contract.build_manifest(
+        project_name=cfg.get("projectName", os.path.basename(project_root)),
+        project_root=project_root,
+        engine_info=engine_info,
+        config_echo=config_echo,
+        sources=extracted_sources,
+        global_warnings=global_warnings,
+        tool_version=TOOL_VERSION,
+    )
+
+
 def _write_outputs(output_dir: str, manifest: dict, sources: list[dict], cfg: dict) -> str:
+    """Orquesta la escritura de la salida en el orden load-bearing: crear
+    directorios -> serializar todo a memoria -> escribir JSON -> render del
+    index.html. La serialización va ANTES de abrir ningún archivo para no
+    dejar salida a medio escribir si algo no fuera serializable."""
+    _ensure_output_dirs(output_dir)
+    manifest_text, sources_text = _serialize_outputs(manifest, sources, cfg)
+    _write_json_files(output_dir, manifest_text, sources_text)
+    return _render_index_html(output_dir, manifest, sources, cfg)
+
+
+def _ensure_output_dirs(output_dir: str) -> None:
     try:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "data"), exist_ok=True)
     except OSError as e:
         raise IOWriteError(f"no se pudo crear {output_dir}: {e}")
 
+
+def _serialize_outputs(manifest: dict, sources: list[dict], cfg: dict) -> tuple[str, list[tuple[str, str]] | None]:
     # Serializar TODO a texto en memoria antes de abrir ningún archivo en modo
     # "w" (que trunca inmediatamente). Así, si json.dumps() fallara por algún
     # valor no serializable que se nos escapó (regla transversal: nunca debería
@@ -497,27 +553,33 @@ def _write_outputs(output_dir: str, manifest: dict, sources: list[dict], cfg: di
             ]
     except (TypeError, ValueError) as e:
         raise IOWriteError(f"no se pudo serializar la salida a JSON: {e}")
+    return manifest_text, sources_text
 
+
+def _write_text_file(path: str, text: str) -> None:
+    """Escribe `text` a `path` en UTF-8 (modo 'w', trunca). El OSError, si lo
+    hay, se propaga para que el llamador arme el mensaje IOWriteError adecuado."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _write_json_files(output_dir: str, manifest_text: str, sources_text: list[tuple[str, str]] | None) -> None:
     try:
-        with open(os.path.join(output_dir, ".gitignore"), "w", encoding="utf-8") as f:
-            f.write("*\n")
-
-        with open(os.path.join(output_dir, "manifest.json"), "w", encoding="utf-8") as f:
-            f.write(manifest_text)
-
+        _write_text_file(os.path.join(output_dir, ".gitignore"), "*\n")
+        _write_text_file(os.path.join(output_dir, "manifest.json"), manifest_text)
         if sources_text is not None:
             for source_id, text in sources_text:
-                with open(os.path.join(output_dir, "data", f"{source_id}.json"), "w", encoding="utf-8") as f:
-                    f.write(text)
+                _write_text_file(os.path.join(output_dir, "data", f"{source_id}.json"), text)
     except OSError as e:
         raise IOWriteError(f"error de I/O al escribir salida: {e}")
 
+
+def _render_index_html(output_dir: str, manifest: dict, sources: list[dict], cfg: dict) -> str:
     util.log("render index.html ...")
     html = render.render(manifest, sources, cfg["viewer"])
     index_path = os.path.join(output_dir, "index.html")
     try:
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write(html)
+        _write_text_file(index_path, html)
     except OSError as e:
         raise IOWriteError(f"error de I/O al escribir {index_path}: {e}")
 
@@ -772,19 +834,7 @@ def main(argv: list[str]) -> int:
 
     try:
         return args.func(args)
-    except UsageError as e:
-        util.log_err(str(e))
-        return e.exit_code
-    except EngineError as e:
-        util.log_err(str(e))
-        return e.exit_code
-    except ConfigError as e:
-        util.log_err(str(e))
-        return e.exit_code
-    except NoExtractableError as e:
-        util.log_err(str(e))
-        return e.exit_code
-    except IOWriteError as e:
+    except _EXIT_ERRORS as e:
         util.log_err(str(e))
         return e.exit_code
 

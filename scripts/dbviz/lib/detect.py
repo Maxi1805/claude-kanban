@@ -39,45 +39,55 @@ def _read_bytes_at(path: str, offset: int, n: int) -> bytes:
         return b""
 
 
+def _classify_delimited(path: str, ext: str):
+    """CSV/TSV: olfatea el delimitador (research-extract §6)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(8192)
+    except OSError:
+        return None, None
+    if not sample.strip():
+        return None, None
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        delim = dialect.delimiter
+    except csv.Error:
+        delim = "\t" if ext == ".tsv" else ","
+    kind = "tsv" if delim == "\t" else "csv"
+    return kind, "high"
+
+
+def _classify_json(path: str):
+    """.json: array -> json/high, dict-de-listas -> json/medium; si no parsea,
+    puede ser NDJSON con extensión .json."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        # puede ser NDJSON con extensión .json
+        return ("ndjson", "medium") if _looks_like_ndjson(path) else (None, None)
+    if isinstance(data, list):
+        return "json", "high"
+    is_dict_of_lists = isinstance(data, dict) and data and all(
+        isinstance(v, list) for v in data.values() if v is not None)
+    return ("json", "medium") if is_dict_of_lists else (None, None)
+
+
+def _classify_ndjson(path: str):
+    """.ndjson/.jsonl: NDJSON si la mayoría de las líneas parsean como JSON."""
+    if _looks_like_ndjson(path):
+        return "ndjson", "high"
+    return None, None
+
+
 def classify_textfile(path: str, ext: str):
     """(kind, confidence) o (None, None). research-extract §6."""
     if ext in (".csv", ".tsv"):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                sample = f.read(8192)
-        except OSError:
-            return None, None
-        if not sample.strip():
-            return None, None
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-            delim = dialect.delimiter
-        except csv.Error:
-            delim = "\t" if ext == ".tsv" else ","
-        kind = "tsv" if delim == "\t" else "csv"
-        return kind, "high"
-
-    if ext in (".json",):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            # puede ser NDJSON con extensión .json
-            if _looks_like_ndjson(path):
-                return "ndjson", "medium"
-            return None, None
-        if isinstance(data, list):
-            return "json", "high"
-        if isinstance(data, dict) and data and all(
-                isinstance(v, list) for v in data.values() if v is not None):
-            return "json", "medium"
-        return None, None
-
+        return _classify_delimited(path, ext)
+    if ext == ".json":
+        return _classify_json(path)
     if ext in (".ndjson", ".jsonl"):
-        if _looks_like_ndjson(path):
-            return "ndjson", "high"
-        return None, None
-
+        return _classify_ndjson(path)
     return None, None
 
 
@@ -133,6 +143,58 @@ def _walk(project_root: str, roots: list[str], max_depth: int, follow_symlinks: 
                 yield os.path.join(dirpath, fn)
 
 
+def _prefilter_path(path: str, norm_rel: str, exclude: list[str],
+                    include: list[str], max_file_size: int) -> int | None:
+    """Devuelve el tamaño en bytes si el archivo debe clasificarse, o None si
+    hay que saltearlo (excluido, ruido, sidecar -wal/-shm, ilegible o gigante).
+    """
+    if util.matches_any(norm_rel, exclude) and not util.matches_any(norm_rel, include):
+        return None
+    base_name = os.path.basename(path)
+    if base_name in NOISE_NAMES or "nssdb" in norm_rel:
+        return None
+    # Los -wal/-shm nunca son fuentes propias (van asociados a su .db)
+    if norm_rel.endswith("-wal") or norm_rel.endswith("-shm") or norm_rel.endswith("-journal"):
+        return None
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size > max_file_size:
+        return None
+    return size
+
+
+def _classify_source_file(path: str, rel: str, size: int, ext: str) -> dict | None:
+    """Clasifica un archivo ya prefiltrado a un candidato (sqlite/duckdb/texto),
+    o None si no es una fuente extraíble. La prueba de SQLite son los magic
+    bytes; la extensión sola nunca alcanza (research-extract §1.1/§1.3)."""
+    if _read_first_bytes(path, 16) == SQLITE_MAGIC:
+        return {
+            "kind": "sqlite", "path": rel, "abspath": os.path.abspath(path),
+            "detectedBy": "magic-bytes", "confidence": "high",
+            "label": os.path.basename(path), "sizeBytes": size,
+        }
+    if ext == ".duckdb" and _read_bytes_at(path, 8, 4) == DUCKDB_MAGIC_OFFSET8:
+        return {
+            "kind": "duckdb", "path": rel, "abspath": os.path.abspath(path),
+            "detectedBy": "magic-bytes", "confidence": "high",
+            "label": os.path.basename(path), "sizeBytes": size,
+        }
+    if ext in FILE_EXTS:
+        k, conf = classify_textfile(path, ext)
+        if k:
+            return {
+                "kind": k, "path": rel, "abspath": os.path.abspath(path),
+                "detectedBy": "extension", "confidence": conf,
+                "label": os.path.basename(path), "sizeBytes": size,
+            }
+        return None
+    if ext in DB_EXTS:
+        util.log_verbose(f"descartado {rel}: extensión de BD pero sin magic SQLite")
+    return None
+
+
 def detect(project_root: str, cfg: dict, extra_include: list[str] | None = None,
            extra_exclude: list[str] | None = None) -> list[dict]:
     scan = cfg.get("scan", {})
@@ -150,60 +212,20 @@ def detect(project_root: str, cfg: dict, extra_include: list[str] | None = None,
         rel = os.path.relpath(path, project_root)
         norm_rel = rel.replace(os.sep, "/")
 
-        if util.matches_any(norm_rel, exclude) and not util.matches_any(norm_rel, include):
-            continue
-        base_name = os.path.basename(path)
-        if base_name in NOISE_NAMES or "nssdb" in norm_rel:
-            continue
-
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
-        if size > max_file_size:
+        size = _prefilter_path(path, norm_rel, exclude, include, max_file_size)
+        if size is None:
             continue
 
         ext = os.path.splitext(path)[1].lower()
-
-        # Los -wal/-shm nunca son fuentes propias (van asociados a su .db)
-        if norm_rel.endswith("-wal") or norm_rel.endswith("-shm") or norm_rel.endswith("-journal"):
+        cand = _classify_source_file(path, rel, size, ext)
+        if cand is None:
             continue
-
-        head16 = _read_first_bytes(path, 16)
-        if head16 == SQLITE_MAGIC:
-            abspath = os.path.abspath(path)
-            if abspath in seen_paths:
+        # dedupe de SQLite por abspath (un symlink puede reapuntar al mismo .db)
+        if cand["kind"] == "sqlite":
+            if cand["abspath"] in seen_paths:
                 continue
-            seen_paths.add(abspath)
-            candidates.append({
-                "kind": "sqlite", "path": rel, "abspath": abspath,
-                "detectedBy": "magic-bytes", "confidence": "high",
-                "label": os.path.basename(path), "sizeBytes": size,
-            })
-            continue
-
-        if ext == ".duckdb" and _read_bytes_at(path, 8, 4) == DUCKDB_MAGIC_OFFSET8:
-            abspath = os.path.abspath(path)
-            candidates.append({
-                "kind": "duckdb", "path": rel, "abspath": abspath,
-                "detectedBy": "magic-bytes", "confidence": "high",
-                "label": os.path.basename(path), "sizeBytes": size,
-            })
-            continue
-
-        if ext in FILE_EXTS:
-            k, conf = classify_textfile(path, ext)
-            if k:
-                abspath = os.path.abspath(path)
-                candidates.append({
-                    "kind": k, "path": rel, "abspath": abspath,
-                    "detectedBy": "extension", "confidence": conf,
-                    "label": os.path.basename(path), "sizeBytes": size,
-                })
-            continue
-
-        if ext in DB_EXTS:
-            util.log_verbose(f"descartado {rel}: extensión de BD pero sin magic SQLite")
+            seen_paths.add(cand["abspath"])
+        candidates.append(cand)
 
     # ORM / DATABASE_URL: report-only
     orm_candidates = schema_orm.detect_orm_and_urls(project_root, roots, exclude)
