@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { config } from "../config.js";
-import { ensureEngineSchema } from "../services/engine/schema.js";
+import { ensureEngineSchema } from "claude-kanban-motor";
 
 export type DB = Database.Database;
 

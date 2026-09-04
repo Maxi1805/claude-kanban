@@ -1,0 +1,352 @@
+{
+  "$schema": "informational — inventario versionado de constantes forma-lista/forma-umbral, ver PLAN.md §7",
+  "version": 2,
+  "scannedFiles": [
+    "code-analyzer.ts",
+    "code-grammar.ts",
+    "code-suggest.ts"
+  ],
+  "methodology": "Escaneo multilínea, consciente de `export const`, sobre los 3 archivos de la capa de análisis (F-RETIRO-VÍA-VIEJA: bajó de 7 a 3 — pattern-structural.ts/pattern-wrapping.ts/pattern-behavioral.ts/code-opportunities.ts se borraron enteros). Formas reconocidas: regex literal, `new Set(`, array `[`, objeto `{` (para que envolver una lista en un objeto no la esconda del inventario), número. Ver no-unlisted-lexicon.test.ts.",
+  "classifications": {
+    "product-config": "Configuración de producto — legítima, no es un supuesto sobre el código analizado.",
+    "grammar-node-name": "Nombre de tipo de nodo de gramática — derivable por sonda (introspección), fallback documentado.",
+    "domain-lexicon": "Léxico de dominio — la violación real de 'cero listas por lenguaje'.",
+    "threshold-cited": "Umbral con cita académica o de industria (Sonar, RuboCop, Kerievsky, ...).",
+    "threshold-uncited": "Umbral sin cita — candidato a derivarse del corpus (F6).",
+    "engineering-budget": "Presupuesto de ingeniería — no afecta qué se detecta, sólo cuánto CPU/memoria se gasta."
+  },
+  "reportedOutOfScope": {
+    "note": "Constantes forma-umbral reportadas por los paquetes de la Ola 3 (P2, P3) en archivos que no-unlisted-lexicon.test.ts NO escanea (sólo escanea `scannedFiles`, los 3 de la capa de análisis; ni `graph/` ni `db/` están ahí — decisión de alcance explícita, no un vacío). Este bloque es documentación para humanos, no lo lee ningún test: agregarlas a `entries` rompería la compuerta 'sin entradas fantasma' porque el escaneo no llega a estos archivos. Candidatas a inventario mecánico si una ola futura amplía `scannedFiles`/`ANALYSIS_FILES`.",
+    "entries": [
+      {
+        "file": "src/server/services/graph/build.ts",
+        "line": 411,
+        "name": "INCREMENTAL_YIELD_BUDGET_MS",
+        "shape": "number",
+        "classification": "engineering-budget",
+        "note": "milisegundos de cómputo entre cesiones al event loop (setImmediate) dentro de buildGraphIncremental. Reportado por P2. Línea actualizada en la integración de F4 (paquete B corrió el archivo; era 372)."
+      },
+      {
+        "file": "src/server/services/graph/build.ts",
+        "line": 426,
+        "name": "CANDIDATE_BATCH_SIZE",
+        "shape": "number",
+        "classification": "engineering-budget",
+        "note": "tamaño de sub-lote al indexar candidatos dentro de un archivo-hub, para no bloquear el event loop en un solo tirón. Reportado por P2. Línea actualizada en la integración de F4 (paquete B corrió el archivo; era 387)."
+      },
+      {
+        "file": "src/server/services/graph/build.ts",
+        "line": 146,
+        "name": "REOPENING_LANGUAGES",
+        "shape": "set",
+        "classification": "domain-lexicon",
+        "note": "F4/paquete B: lenguajes que reabren declaraciones (hoy sólo Ruby, `class Foo; end` repetido) — gatea cuándo `buildCandidatesForFile` excluye un target `decl-name` que es el gemelo de árbol paralelo de otro archivo (el fix de global-uniqueness en Java). Reportado por el paquete B."
+      },
+      {
+        "file": "src/server/services/graph/gate/resolve-gate-java.test.ts",
+        "line": 92,
+        "name": "PRECISION_FLOOR_JAVA",
+        "shape": "number",
+        "classification": "threshold-uncited",
+        "note": "piso de NO-REGRESIÓN (0.6), no el objetivo 0.9 de `resolve-gate.test.ts` — waiver completo en el docstring del archivo. Reportado por el paquete F; mismo patrón que `PRECISION_GATE` de `resolve-gate.test.ts` (también fuera de `scannedFiles`)."
+      },
+      {
+        "file": "src/server/db/code-facts-repository.ts",
+        "line": 116,
+        "name": "FACTS_GZIP_LEVEL",
+        "shape": "number",
+        "classification": "engineering-budget",
+        "note": "nivel de compresión gzip de facts_blob (1 = rápido, prioriza latencia de escritura sobre ratio). Reportado por P3."
+      },
+      {
+        "file": "src/server/db/code-facts-repository.ts",
+        "line": 133,
+        "name": "FACTS_MAX_BYTES",
+        "shape": "number",
+        "classification": "engineering-budget",
+        "note": "presupuesto de bytes por desalojo LRU de code_file_facts (500 MB, mismo número que el contrato original). Reportado por P3; P3 advierte que no se remidió tras el arreglo de declaraciones fantasma de P1, que baja el tamaño real por fila."
+      },
+      {
+        "file": "src/server/services/ingest-exclusion.ts",
+        "line": 287,
+        "name": "TEST_DIR_NAMES",
+        "shape": "set",
+        "classification": "product-config",
+        "note": "Antes vivía en `code-analyzer.ts:1114` (entry retirada de `entries` por el guardián de H3, ola de precisión/8-lenguajes: D-TEST — frente distinto de H3 — la movió a `ingest-exclusion.ts` junto con el resto de las exclusiones de ingesta, ver docstring de `CollectFilesOptions` en `code-analyzer.ts`). Fuera de `scannedFiles`, igual que el resto de este bloque."
+      },
+      {
+        "file": "src/server/services/ingest-exclusion.ts",
+        "line": 320,
+        "name": "TEST_FILE_PATTERNS",
+        "shape": "array",
+        "classification": "product-config",
+        "note": "Antes vivía en `code-analyzer.ts:1115` (entry retirada de `entries` por el guardián de H3; misma causa que `TEST_DIR_NAMES` arriba)."
+      }
+    ]
+  },
+  "totalEntries": 29,
+  "countsByClassification": {
+    "product-config": 4,
+    "threshold-uncited": 2,
+    "domain-lexicon": 1,
+    "engineering-budget": 9,
+    "threshold-cited": 2,
+    "grammar-node-name": 11
+  },
+  "entries": [
+    {
+      "file": "code-analyzer.ts",
+      "line": 1009,
+      "name": "LANGUAGE_DECLS",
+      "shape": "array",
+      "classification": "product-config",
+      "retirementPhase": "n/a — configuración legítima, no se retira",
+      "note": "F5: `export` agregado (antes `const` sin exportar) para que `capability-matrix.test.ts` derive `DerivedNodeSets`/`Capability` de los probes REALES de producción en vez de retipearlos o extraerlos por regex del texto fuente. Línea corrida por las nueve sondas ganando construcciones que antes no ejercitaban (F5, ver `capability-matrix.test.ts`). Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 822). Línea corrida por la tarea del caché de análisis (import type de `PatternHypothesis`, ver `analyze-cache.ts`); era 1003. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor (import de `extractReceiverFacts`, ver `graph/edges/invocacion-indirecta.ts`); era 1004. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1095,
+      "name": "SKIP_DIRS",
+      "shape": "set",
+      "classification": "product-config",
+      "retirementPhase": "n/a — configuración legítima, no se retira",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 870). Corrida de nuevo por el guardián de H3 (ola de precisión/8-lenguajes): TEST_DIR_NAMES/TEST_FILE_PATTERNS, que antes vivían inmediatamente después de esta constante, se movieron a `ingest-exclusion.ts` (D-TEST, frente distinto de H3) — ver `reportedOutOfScope` para su nueva ubicación. Línea corrida por la tarea del caché de análisis; era 1081. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1082. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1149,
+      "name": "MIN_CLONE_NODES",
+      "shape": "number",
+      "classification": "threshold-uncited",
+      "retirementPhase": "F6 — derivado: Max(piso declarado, p95 del repo, p95 del corpus), benchmarks.json",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 912). Línea corrida por la tarea del caché de análisis; era 1134. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1135. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1150,
+      "name": "MIN_CLONE_LINES",
+      "shape": "number",
+      "classification": "threshold-uncited",
+      "retirementPhase": "F6 — derivado: Max(piso declarado, p95 del repo, p95 del corpus), benchmarks.json",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 913). Línea corrida por la tarea del caché de análisis; era 1135. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1136. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1165,
+      "name": "POPULARITY",
+      "shape": "object",
+      "classification": "product-config",
+      "retirementPhase": "n/a — configuración legítima, no se retira",
+      "note": "Record<string, number>, no un umbral de detección: puntaje 0-3 sólo para mostrar en la UI qué tan común es un patrón (fuente citada: refactoring.guru). No decide qué se reporta. Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 928). Línea corrida por la tarea del caché de análisis; era 1150. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1151. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1176,
+      "name": "FACTORY_NAME",
+      "shape": "regex",
+      "classification": "domain-lexicon",
+      "retirementPhase": "F8 — slot centinela / relación estructural, ver PLAN.md §7.2 (brechas de recall declaradas donde no hay reemplazo derivable)",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 939). Línea corrida por la tarea del caché de análisis; era 1161. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1162. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1177,
+      "name": "MAX_FILE_BYTES",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de CPU/memoria",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 940). Línea corrida por la tarea del caché de análisis; era 1162. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1163. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1192,
+      "name": "DEFAULT_ANALYZE_LIMITS",
+      "shape": "object",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de CPU/memoria",
+      "note": "antes dos `const` numéricas sueltas (MAX_FINDINGS=200, MAX_OPPORTUNITIES=100); ahora un objeto. Forma-objeto: fuera del grep original de PLAN.md §7 (que sólo reconoce regex/Set/array/número), incluida acá para que envolver una constante en un objeto no sea una forma de esquivar el inventario. F5: `maxFindings` pasó de cap del análisis a tamaño de página por defecto sobre GRUPOS (CONTRATO-F5.md Contrato 2 §2.5) — el valor no cambió, sólo su docstring. Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 955). Línea corrida por la tarea del caché de análisis; era 1177. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1178. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1210,
+      "name": "MAX_STORED_FINDINGS",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de almacenamiento",
+      "note": "F5 — CONTRATO-F5.md Contrato 2 §2.6: techo duro de GRUPOS almacenados por análisis, aplicado DESPUÉS del ranking completo. `findingsTotal`/`totalByKind` se calculan antes de este techo, así que el conteo honesto sobrevive aunque las filas no. Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 974). Línea corrida por la tarea del caché de análisis; era 1195. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1196. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1221,
+      "name": "MAX_WALK_SLICE_MS",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de CPU/memoria",
+      "note": "el comentario que documenta esta constante (code-analyzer.ts:602-605) cita cifras medidas contra los repos privados del usuario (Backend/Frontend) — ver hallazgo del lint de cifras del usuario. La CONSTANTE en sí es presupuesto de ingeniería legítimo; el comentario es el problema, no el número 2. Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 985). Línea corrida por la tarea del caché de análisis; era 1206. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1207. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1222,
+      "name": "CLOCK_CHECK_INTERVAL",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de CPU/memoria",
+      "note": "Línea corrida en la integración de P3 (cableado de `carrierFacts`; era 986). Línea corrida por la tarea del caché de análisis; era 1207. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor; era 1208. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 1695,
+      "name": "FACTS_SCHEMA_VERSION",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo si un `FileFacts` cacheado (F3, `code_file_facts.facts_json`) se lee como hit o como miss",
+      "note": "versiona LA FORMA del hecho por archivo, no el análisis (eso es `ANALYZER_VERSION`, census.ts). Sube cuando `FileFacts` gana/pierde/cambia un campo; una fila con otra versión es SIEMPRE un miss, nunca una migración. Línea corrida en la integración de P3 (cableado de `carrierFacts` en `FileFacts`/`analyzeFile`/`crossAnalyze`, ver graph/build.ts:87; era 1369). Línea corrida por la tarea del caché de análisis; era 1623. Bump 7→8 y línea corrida por la tarea de `invokes-indirect`/generalización del receptor (`FileFacts` gana `receivers`, ver `graph/edges/invocacion-indirecta.ts`); era 1624. Línea corrida por el guardián de la Ola O (grupo cola: N7/N11/N12/N13), por trabajo concurrente de N12/N13 sobre este mismo archivo compartido; era 1642. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 3510,
+      "name": "MAX_TEXT_SPAN_LINES",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta, sólo presupuesto de CPU/memoria",
+      "note": "Línea corrida en R1 (`resolveLiveFileUnit`/`LiveFileUnit`/`CrossInput.dir`, reparseo bajo demanda en `crossAnalyze`; era 2622, después 2741). Corrida de nuevo en la integración de la Ola D, al corregir en los docstrings de `resolveLiveFileUnit`/`crossAnalyze` la afirmación medida-como-falsa de que el reparseo bajo demanda no cuesta memoria. Corrida de nuevo por el guardián de H3: `collectChainArms`/`ladderLength`/`ladderInstantiatesTypes` (arreglo de `conditional-chain`, ~140 líneas nuevas) se insertó antes de esta constante; era 2769. Línea corrida por trabajo concurrente de otra ola sobre este mismo archivo compartido y sin trackear en git, más el import de `PatternHypothesis` de la tarea del caché de análisis; era 2890. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor, más trabajo concurrente de otra ola sobre este mismo archivo compartido; era 2894. Línea corrida por el guardián de la Ola O (grupo cola: N7/N11/N12/N13), por trabajo concurrente de N12/N13 (`intraGraphCache`/`computeGraphFingerprint`/`attachFindingNodes` wiring) sobre este mismo archivo compartido; era 3119. Línea corrida por el frente V1 de la Ola V (la pasada de grafo de las hipótesis en `crossAnalyze` + `hipotesisConGrafoHabilitado`, insertados antes de esta constante); era 3213. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó. Línea corrida por el guardián de la Ola AW (los comentarios que documentan el defecto de `middle-man`/`repo.functions` en `code-analyzer.ts:2388` y el campo aditivo `RepoUnit.dir` para `repo-name-index.ts`, insertados antes de esta constante); era 3387. Línea corrida por el guardián de la Ola AX (AX6, `buildRepoFunctionUnits` + el enchufe de `repoFunctions` sólo en la pasada `inter-file`, el arreglo del cable de `repo.functions` que hasta esta ola dejaba a `middle-man` en 0 hallazgos, insertado antes de esta constante); era 3398."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 3979,
+      "name": "MIN_OCCURRENCES",
+      "shape": "number",
+      "classification": "threshold-cited",
+      "retirementPhase": "n/a — ya tiene cita académica/industria, no necesita reemplazo genérico",
+      "citation": "Kerievsky, regla de tres — reclasificado desde 'presupuesto de ingeniería' (así estaba en PLAN.md §7.1): sí tiene cita y sí afecta QUÉ se reporta (gatea cuándo la duplicación se convierte en hallazgo), no sólo cómo se reparte CPU — el criterio propio de 7.2 para 'presupuesto' ('no afectan qué se encuentra') no le aplica. Desviación reportada.",
+      "note": "Línea corrida en R1 (`resolveLiveFileUnit`/`LiveFileUnit`/`CrossInput.dir`, reparseo bajo demanda en `crossAnalyze`; era 2832, después 2951). Corrida de nuevo en la integración de la Ola D, por la misma corrección de docstrings que movió `MAX_TEXT_SPAN_LINES`. Corrida de nuevo por el guardián de H3, misma causa que `MAX_TEXT_SPAN_LINES`; era 2979. Línea corrida por la función `toPublicHypothesis` que esta tarea agregó antes de `locationDedupeKey` (fix del leak de `refreshState`/`missingEdgeKinds` hacia `CodeFindingHypothesis` — ver `analyze-cache.ts` y el docstring de `toPublicHypothesis`), más trabajo concurrente de otra ola sobre este mismo archivo; era 3081. Línea corrida por la tarea de `invokes-indirect`/generalización del receptor, más trabajo concurrente de otra ola sobre este mismo archivo compartido; era 3120. Línea corrida por el guardián de la Ola O (grupo cola: N7/N11/N12/N13), por trabajo concurrente de N12/N13 sobre este mismo archivo compartido; era 3345. Línea corrida por el frente F2 de la Ola Q (`detalleDeTodosLosMiembros` + sus dos presupuestos, insertados antes de `toGroupedCodeFinding`); era 3439. Línea corrida por el frente V1 de la Ola V, misma causa que `MAX_TEXT_SPAN_LINES`; era 3537. Línea corrida por el frente AC1 de la Ola AC (`hypothesisIdentityKey` + `hypothesesOfAllMembers`, insertados antes de `toGroupedCodeFinding` para que un grupo publique las hipótesis de TODOS sus miembros y no sólo las del representante); era 3671. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó. Línea corrida por el guardián de la Ola AW (los comentarios que documentan el defecto de `middle-man`/`repo.functions` en `code-analyzer.ts:2388` y el campo aditivo `RepoUnit.dir` para `repo-name-index.ts`, insertados antes de esta constante); era 3852. Línea corrida por el guardián de la Ola AX (AX6, misma causa que `MAX_TEXT_SPAN_LINES`); era 3863."
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 187,
+      "name": "LOOP_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 188,
+      "name": "EXCEPTION_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 189,
+      "name": "SWITCH_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 191,
+      "name": "SWITCH_ARM_EXCLUDE",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 193,
+      "name": "SWITCH_WRAPPER_EXCLUDE",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 210,
+      "name": "TERNARY_NAME",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 224,
+      "name": "CONSTRUCTOR_NODE_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)"
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 248,
+      "name": "RECORD_NODE_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)",
+      "note": "F5, hallado auditando las nueve sondas con el mecanismo anti-sonda-incompleta: Java y C# comparten literalmente el nodo `record_declaration`, y su forma (`body` + `parameters`, el header posicional del record) es indistinguible de un constructor bajo `isFunctionLike` — sin este slot, agregar `record` a las sondas lo habría clasificado como función, nunca como tipo."
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 303,
+      "name": "GO_TYPE_SPEC_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)",
+      "note": "Observado durante la tarea de `invokes-indirect`/generalización del receptor (frente distinto, RAICES.md PENDIENTES ítem 1, en curso concurrente sobre este mismo archivo compartido) — no introducido por esa tarea, sólo registrado acá para no dejar el inventario con entradas fantasma. `type_spec` de Go nunca expone `body` (mismo hueco que este módulo ya documentaba); mismo estándar que `RECORD_NODE_WORD`/`CONSTRUCTOR_NODE_WORD`: nombre de tipo de nodo dedicado, no vocabulario de lenguaje."
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 348,
+      "name": "GO_METHOD_SPEC_WORD",
+      "shape": "regex",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)",
+      "note": "Mismo motivo que `GO_TYPE_SPEC_WORD` arriba — observado, no introducido, por la tarea de `invokes-indirect`/generalización del receptor. `method_spec` (firma de método de interfaz Go) nunca expone `body`, a diferencia de `method_declaration` (concreto), que sí lo tiene y ya entraba a `functionNodes` sin este slot."
+    },
+    {
+      "file": "code-grammar.ts",
+      "line": 372,
+      "name": "CONSTRUCTOR_NAMES",
+      "shape": "set",
+      "classification": "grammar-node-name",
+      "retirementPhase": "F8 — slot centinela derivado por sonda (deriveNodeSets/probes)",
+      "note": "F1 la centralizó como `export const` (antes 3 copias `const` sin exportar). El grep de una sola línea de PLAN.md §7 NO matchea `export const` — sigue viva pero el método original dejaría de verla. Cerrado acá incluyendo `export` en el patrón. Línea corrida por `GO_TYPE_SPEC_WORD`/`GO_METHOD_SPEC_WORD` (arriba), insertadas antes de esta constante por trabajo concurrente de otra ola sobre este mismo archivo; era 268."
+    },
+    {
+      "file": "code-suggest.ts",
+      "line": 211,
+      "name": "MIN_BRANCHES_FOR_SWITCH_SMELL",
+      "shape": "number",
+      "classification": "threshold-cited",
+      "retirementPhase": "n/a — ya tiene cita académica/industria, no necesita reemplazo genérico",
+      "citation": "Sonar S1301 (mínimo, no techo)"
+    },
+    {
+      "file": "code-suggest.ts",
+      "line": 217,
+      "name": "SRC",
+      "shape": "object",
+      "classification": "product-config",
+      "retirementPhase": "n/a — configuración legítima, no se retira"
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 3675,
+      "name": "MAX_MIEMBROS_DETALLADOS",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta: es cuántos miembros del grupo se NOMBRAN en el `detail` de una fila que ya existe",
+      "note": "Ola Q, frente F2. Cuántos miembros NO representantes se nombran en el `detail` de un grupo antes de resumir el resto con \"y N más\". El grupo, su `memberCount` y sus `locations` no cambian: es legibilidad de UNA celda (la misma razón por la que `detect/inter-file/duplication.ts#MAX_COPIAS_DETALLADAS` eligió 6). Ningún hallazgo se emite ni se deja de emitir por este número. Línea corrida por el frente AC1 de la Ola AC (`hypothesisIdentityKey` + `hypothesesOfAllMembers`, insertados antes de `toGroupedCodeFinding` para que un grupo publique las hipótesis de TODOS sus miembros y no sólo las del representante); era 3504. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó. Línea corrida por el guardián de la Ola AW (los comentarios que documentan el defecto de `middle-man`/`repo.functions` en `code-analyzer.ts:2388` y el campo aditivo `RepoUnit.dir` para `repo-name-index.ts`, insertados antes de esta constante); era 3548. Línea corrida por el guardián de la Ola AX (AX6, misma causa que `MAX_TEXT_SPAN_LINES`); era 3559."
+    },
+    {
+      "file": "code-analyzer.ts",
+      "line": 3688,
+      "name": "PRESUPUESTO_DETALLE_AGREGADO",
+      "shape": "number",
+      "classification": "engineering-budget",
+      "retirementPhase": "n/a — no afecta qué se detecta: es el largo del texto de una fila que ya existe",
+      "note": "Ola Q, frente F2. Presupuesto de caracteres del tramo AGREGADO del `detail` (el del representante nunca se recorta). MEDIDO sobre preact: sin tope, la tarjeta de `shotgun-surgery` de \"useState\" (7 miembros con su párrafo de hipótesis) pasa de 4.000 caracteres. Se corta por MIEMBRO ENTERO, nunca a mitad de un texto. Línea corrida por el frente AC1 de la Ola AC (`hypothesisIdentityKey` + `hypothesesOfAllMembers`, insertados antes de `toGroupedCodeFinding` para que un grupo publique las hipótesis de TODOS sus miembros y no sólo las del representante); era 3517. Línea corrida por la Ola AI / frente AI3 (desambiguación de ids repetidos: un import y una llamada arriba, más dos comentarios de invariante); el VALOR no se tocó. Línea corrida por el guardián de la Ola AW (los comentarios que documentan el defecto de `middle-man`/`repo.functions` en `code-analyzer.ts:2388` y el campo aditivo `RepoUnit.dir` para `repo-name-index.ts`, insertados antes de esta constante); era 3561. Línea corrida por el guardián de la Ola AX (AX6, misma causa que `MAX_TEXT_SPAN_LINES`); era 3572."
+    }
+  ]
+}

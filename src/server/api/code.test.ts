@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createCodeRouter } from "./code.js";
 import { CodeInspectorServiceImpl } from "../services/code-inspector.js";
-import * as codeAnalyzer from "../services/code-analyzer.js";
+import * as codeAnalyzer from "claude-kanban-motor/analyzer";
 import { initDb, type DB } from "../db/index.js";
 import type { Repositories } from "../../shared/interfaces.js";
 import type { Task, TaskCodeResponse, TaskRepo } from "../../shared/types.js";

@@ -13,3 +13,10 @@ dbviz.config.json
 .dbviz/
 scripts/dbviz/__pycache__/
 scripts/dbviz/lib/__pycache__/
+# corpus: repos ajenos clonados para medir (ver scripts de clonado en el motor)
+corpus/
+corpus-app/
+# salida de graphify
+graphify-out/
+# docs y notas del proyecto, fuera del repo
+claude-kanban-docs/

@@ -21,9 +21,11 @@
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "claude-kanban-motor": ["../claude-kanban-motor/src/server/services/engine/index.ts"],
+      "claude-kanban-motor/analyzer": ["../claude-kanban-motor/src/server/services/code-analyzer.ts"]
     }
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "web", "data"]
+  "include": ["src/**/*.ts", "scripts/**/*.mts", "../claude-kanban-motor/src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "web", "data", "../claude-kanban-motor/**/*.test.ts", "../claude-kanban-motor/src/server/db/index.ts"]
 }

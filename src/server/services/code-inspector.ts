@@ -48,8 +48,8 @@
  */
 import fs from "node:fs/promises";
 
-import { worktreeSignature } from "./code-analyzer.js";
-import { RepoAnalysisEngine, type CodeFindingDecision } from "./engine/repo-analysis.js";
+import { worktreeSignature } from "claude-kanban-motor/analyzer";
+import { RepoAnalysisEngine, type CodeFindingDecision } from "claude-kanban-motor";
 import type { DB } from "../db/index.js";
 import type { CodePageRequest, Repositories } from "../../shared/interfaces.js";
 import type { CodeAnalysis, TaskCodeRepo, TaskCodeResponse } from "../../shared/types.js";

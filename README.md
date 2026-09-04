@@ -40,6 +40,37 @@ npm run test       # vitest run
 npm run typecheck  # tsc --noEmit
 ```
 
+## Caveman mode (per task)
+
+Each card carries a checkbox and a level selector that decide whether **that
+task's** Claude session loads the [caveman](https://github.com/JuliusBrussee/caveman)
+plugin — a third-party skill that compresses the agent's prose while leaving
+code, commands and errors byte-for-byte intact.
+
+The plugin is **not bundled**; install it once and the board does the rest:
+
+```bash
+claude plugin marketplace add JuliusBrussee/caveman
+claude plugin install caveman
+```
+
+How the two knobs reach the session:
+
+- **checkbox** → `enabledPlugins` in the task's own `--settings` file, written on
+  every spawn. Off means the plugin is never loaded, so it costs nothing — not
+  even the input tokens of its skill description. Explicit `false` also overrides
+  a global enable in the user's own `settings.json`.
+- **level** (`lite` / `full` / `ultra` / `wenyan`) → the plugin's `/caveman <level>`
+  command, typed into the live pty once the terminal settles, so switching level
+  never needs a restart. The plugin's own default (`full`) is not typed at spawn —
+  it is already what an enabled plugin does, and the round trip would cost a turn.
+- **unchecking a running task** types `normal mode`, the phrase the plugin
+  documents for going back to normal prose (it has no `/caveman off`).
+
+`CK_CAVEMAN_PLUGIN_ID` overrides the `plugin@marketplace` id; by default it is
+detected from `~/.claude/skills/caveman` (the universal installer) or from an
+installed marketplace. An id matching nothing installed is inert.
+
 ## Environment overrides
 
 See `src/server/config.ts`. Notable vars:
@@ -49,6 +80,7 @@ See `src/server/config.ts`. Notable vars:
 - `CK_DB_PATH` — sqlite file (default `data/claude-kanban.db`)
 - `CK_AGENT_COMMAND` — agent command to spawn in the pty (default `claude`)
 - `CK_TEMPLATE_REPO` — repo whose `CLAUDE.md` / `.claude` get symlinked into the session root
+- `CK_CAVEMAN_PLUGIN_ID` — `plugin@marketplace` id for the caveman switch (auto-detected)
 
 ## Status
 
