@@ -75,13 +75,7 @@ function buildServices() {
   const git = new GitServiceImpl(config.worktreeBaseDir);
   const pty = new PtyServiceImpl();
 
-  // The events hub is the board-event broadcaster. The lifecycle (which emits
-  // canonical BoardEventMsg frames) gets it directly; the API routers get a
-  // thin adapter that stamps the `type` discriminant.
-  const eventsHub = createEventsHub();
-  const broadcast = (event: BoardEventMsg): void => eventsHub.broadcast(event);
-  const emit: BoardEventEmitter = (event) =>
-    broadcast({ type: "board:event", ...event });
+  const { eventsHub, broadcast, emit } = createBoardEventWiring();
 
   // Per-repo interactive command shell (one `bash -il` per task,repo). The
   // setup/run/teardown buttons inject their script into this shell; there is no
@@ -99,21 +93,10 @@ function buildServices() {
     broadcast,
   });
 
-  // Read-only filesystem browser backing the repo picker (local-only).
-  const fsBrowser = new FsBrowserServiceImpl(config);
-
-  // Backs the per-task schema diagram: runs each repo's agent-generated
-  // extractor script and diffs the result against the repo's base branch.
-  // Opens no database and assumes no stack.
-  const schemaInspector = new SchemaInspectorServiceImpl(repos, {
-    dataDir: config.dataDir,
-    agentCommand: config.defaultAgentCommand,
-  });
-
-  // Backs the per-task "Código" tab: tree-sitter hotspot detection per repo,
-  // cached against a cheap worktree signature so parsing only re-runs when
-  // the tree actually moved.
-  const codeInspector = new CodeInspectorServiceImpl(repos, db);
+  const { fsBrowser, schemaInspector, codeInspector } = buildInspectors(
+    repos,
+    db,
+  );
 
   // Owns the "waiting" half of agent state: demotes a "working" task to "waiting"
   // once its pty output goes quiet. Promotion to "working" is hook-driven (see
@@ -141,6 +124,51 @@ function buildServices() {
     emit,
     activityMonitor,
   };
+}
+
+/**
+ * The board-event broadcaster wiring. The events hub is the single fan-out; the
+ * lifecycle (which emits canonical BoardEventMsg frames) gets `broadcast`
+ * directly, while the API routers get `emit` — a thin adapter that stamps the
+ * `board:event` `type` discriminant onto their inner events.
+ */
+function createBoardEventWiring(): {
+  eventsHub: ReturnType<typeof createEventsHub>;
+  broadcast: (event: BoardEventMsg) => void;
+  emit: BoardEventEmitter;
+} {
+  const eventsHub = createEventsHub();
+  const broadcast = (event: BoardEventMsg): void => eventsHub.broadcast(event);
+  const emit: BoardEventEmitter = (event) =>
+    broadcast({ type: "board:event", ...event });
+  return { eventsHub, broadcast, emit };
+}
+
+/**
+ * The read-only inspectors backing the panel tabs — none depend on each other,
+ * so they build together off the shared repositories/db:
+ *   • fsBrowser      — the local-only filesystem browser behind the repo picker;
+ *   • schemaInspector — per-task schema diagram (runs each repo's extractor and
+ *     diffs against its base branch; opens no database, assumes no stack);
+ *   • codeInspector   — the "Código" tab's tree-sitter hotspot detection, cached
+ *     against a cheap worktree signature so parsing re-runs only when the tree
+ *     actually moved.
+ */
+function buildInspectors(
+  repos: ReturnType<typeof createRepositories>,
+  db: ReturnType<typeof initDb>,
+): {
+  fsBrowser: FsBrowserServiceImpl;
+  schemaInspector: SchemaInspectorServiceImpl;
+  codeInspector: CodeInspectorServiceImpl;
+} {
+  const fsBrowser = new FsBrowserServiceImpl(config);
+  const schemaInspector = new SchemaInspectorServiceImpl(repos, {
+    dataDir: config.dataDir,
+    agentCommand: config.defaultAgentCommand,
+  });
+  const codeInspector = new CodeInspectorServiceImpl(repos, db);
+  return { fsBrowser, schemaInspector, codeInspector };
 }
 
 /**

@@ -95,32 +95,7 @@ export function attach(
     return;
   }
 
-  const send = (msg: CmdMessage): void => {
-    if (ws.readyState !== ws.OPEN) return;
-    ws.send(JSON.stringify(msg));
-  };
-
-  const sendOutput = (data: string): void => {
-    if (data.length === 0) return;
-    const out: CmdOutputMsg = { type: "cmd:output", data };
-    send(out);
-  };
-
-  // Replay-before-live: register the live listener up front but BUFFER its chunks
-  // until the (synchronous) replay buffer has been sent, then flush in order. The
-  // runner's replay is in-memory so there is no async gap, but buffering keeps
-  // the ordering invariant identical to the pty bridge and robust to future async.
-  let replayDone = false;
-  const liveBuffer: string[] = [];
-
-  const offData = runner.onData(taskId, repoId, (data) => {
-    if (!replayDone) {
-      liveBuffer.push(data);
-      return;
-    }
-    sendOutput(data);
-  });
-
+  const { send, sendOutput } = createSender(ws);
   const emitExit = (exitCode: number | null): void => {
     const msg: CmdExitMsg = { type: "cmd:exit", exitCode };
     send(msg);
@@ -129,22 +104,25 @@ export function attach(
     }
   };
 
-  const bufferedExit: { exitCode: number | null }[] = [];
+  // Replay-before-live: register the live listeners up front but hold their
+  // output/exit in the gate until the replay buffer has been sent, then flush in
+  // arrival order. See {@link ReplayGate}.
+  const gate = new ReplayGate();
+  const offData = runner.onData(taskId, repoId, (data) => {
+    const live = gate.observeData(data);
+    if (live !== null) sendOutput(live);
+  });
   const offExit = runner.onExit(taskId, repoId, (exitCode) => {
-    if (!replayDone) {
-      bufferedExit.push({ exitCode });
-      return;
-    }
-    emitExit(exitCode);
+    if (!gate.observeExit(exitCode)) emitExit(exitCode);
   });
 
-  // Send the replay buffer, then flush any live chunks that arrived meanwhile.
+  // Send the replay buffer, then flush any live chunks / exit that arrived while
+  // the gate was closed, in order.
   const replay = runner.getReplay(taskId, repoId);
   if (replay.data.length > 0) sendOutput(replay.data);
-  replayDone = true;
-  for (const chunk of liveBuffer) sendOutput(chunk);
-  liveBuffer.length = 0;
-  if (bufferedExit.length > 0) emitExit(bufferedExit[0].exitCode);
+  for (const chunk of gate.open()) sendOutput(chunk);
+  const pendingExit = gate.pendingExit();
+  if (pendingExit !== null) emitExit(pendingExit.exitCode);
 
   ws.on("message", (raw) => {
     applyInboundFrame(raw.toString(), addr, runner);
@@ -158,6 +136,70 @@ export function attach(
   };
   ws.on("close", detach);
   ws.on("error", detach);
+}
+
+/**
+ * A socket's frame writers: `send` for any command frame (a no-op once the
+ * socket has left OPEN) and `sendOutput` for a non-empty output chunk.
+ */
+function createSender(ws: WebSocket): {
+  send: (msg: CmdMessage) => void;
+  sendOutput: (data: string) => void;
+} {
+  const send = (msg: CmdMessage): void => {
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify(msg));
+  };
+  const sendOutput = (data: string): void => {
+    if (data.length === 0) return;
+    const out: CmdOutputMsg = { type: "cmd:output", data };
+    send(out);
+  };
+  return { send, sendOutput };
+}
+
+/**
+ * Keeps the replayed buffer and the live stream ordered for one attach: while
+ * CLOSED (before the replay has been sent) live output and an exit are BUFFERED;
+ * {@link open} sends them in arrival order once the replay is out.
+ *
+ * The runner's replay is in-memory so there is no async gap, but buffering keeps
+ * the ordering invariant identical to the pty bridge and robust to future async.
+ */
+class ReplayGate {
+  private open_ = false;
+  private readonly liveBuffer: string[] = [];
+  private bufferedExit: { exitCode: number | null } | null = null;
+
+  /** Account for one live output chunk: forward now, or buffer while closed. */
+  observeData(data: string): string | null {
+    if (!this.open_) {
+      this.liveBuffer.push(data);
+      return null;
+    }
+    return data;
+  }
+
+  /** Account for a shell exit. Returns true when it was buffered (still closed). */
+  observeExit(exitCode: number | null): boolean {
+    if (this.open_) return false;
+    // First exit wins; a shell exits once, but guard against a stray second.
+    this.bufferedExit ??= { exitCode };
+    return true;
+  }
+
+  /** Open the gate and return the buffered live chunks to flush, in order. */
+  open(): string[] {
+    this.open_ = true;
+    const flush = this.liveBuffer.slice();
+    this.liveBuffer.length = 0;
+    return flush;
+  }
+
+  /** The exit buffered while closed, if any (flush it after {@link open}). */
+  pendingExit(): { exitCode: number | null } | null {
+    return this.bufferedExit;
+  }
 }
 
 /**

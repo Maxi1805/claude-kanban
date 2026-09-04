@@ -129,16 +129,7 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
   // dead socket (no listeners to leak, nothing to send).
   if (ws.readyState !== ws.OPEN && ws.readyState !== ws.CONNECTING) return;
 
-  const send = (msg: PtyMessage): void => {
-    if (ws.readyState !== ws.OPEN) return;
-    ws.send(JSON.stringify(msg));
-  };
-
-  const sendOutput = (data: string): void => {
-    if (data.length === 0) return;
-    const out: PtyOutputMsg = { type: "pty:output", taskId, data };
-    send(out);
-  };
+  const { send, sendOutput } = createSender(ws, taskId);
 
   // Replay-before-live ordering, deduped by byte position. See {@link ReplayGate}.
   const gate = new ReplayGate(ptyService.bytePosition(taskId));
@@ -148,27 +139,45 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
     if (live !== null) sendOutput(live);
   });
 
-  // pty exit → notify the client, then close the socket. Buffer an exit that
-  // fires mid-replay so it lands after the replayed history.
-  let bufferedExit: PtyExitMsg | null = null;
-  const emitExit = (msg: PtyExitMsg): void => {
-    send(msg);
-    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
-      ws.close(1000, "pty exited");
-    }
-  };
-  const offExit = ptyService.onExit(taskId, (exitCode, signal) => {
-    const exit: PtyExitMsg = { type: "pty:exit", taskId, exitCode, signal };
-    if (!gate.isOpen) {
-      bufferedExit = exit;
-      return;
-    }
-    emitExit(exit);
+  // pty exit → notify the client, then close the socket; an exit that fires
+  // mid-replay is buffered so it lands after the replayed history.
+  const exit = createExitForwarder(ws, taskId, send, gate);
+  const offExit = ptyService.onExit(taskId, exit.onExit);
+
+  replayThenGoLive(ptyService, taskId, gate, sendOutput, exit);
+
+  ws.on("message", (raw) => {
+    applyInboundFrame(raw.toString(), taskId, ptyService);
   });
 
-  // Capture whether the task was already finished BEFORE we read replay, so a
-  // post-exit reconnect (no live pty) still gets a trailing pty:exit and the UI
-  // shows a finished session instead of a blank/hanging terminal.
+  // Socket closed: detach listeners only. Deliberately do NOT kill the pty so
+  // the agent process survives terminal disconnects / reconnects.
+  const detach = (): void => {
+    offData();
+    offExit();
+  };
+  ws.on("close", detach);
+  ws.on("error", detach);
+}
+
+/**
+ * Send the captured history, THEN let the live stream flow — the replay-before-
+ * live ordering, as one step. Snapshots whether the task had already finished
+ * BEFORE reading replay (so a post-exit reconnect, which will see no live pty,
+ * still gets a trailing pty:exit and the UI shows a finished session), reads the
+ * replay tail and sends it, then opens the gate to flush any chunk that arrived
+ * live during the async read (deduped by byte position). Finally surfaces the
+ * stored exit for that post-exit case — unless a live exit buffered during
+ * replay already took precedence. Replay is best-effort: a failed read still
+ * falls through to live streaming with nothing dropped.
+ */
+function replayThenGoLive(
+  ptyService: PtyService,
+  taskId: string,
+  gate: ReplayGate,
+  sendOutput: (data: string) => void,
+  exit: ReturnType<typeof createExitForwarder>,
+): void {
   const alreadyExited = ptyService.isExited(taskId);
   const storedExit = ptyService.lastExit(taskId);
 
@@ -189,10 +198,8 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
       // If the task had already exited (no live record will fire), surface the
       // stored exit now so the terminal shows the finished session. A live exit
       // buffered during replay takes precedence.
-      if (bufferedExit) {
-        emitExit(bufferedExit);
-      } else if (alreadyExited && storedExit) {
-        emitExit({
+      if (!exit.flushBuffered() && alreadyExited && storedExit) {
+        exit.emit({
           type: "pty:exit",
           taskId,
           exitCode: storedExit.exitCode,
@@ -200,19 +207,72 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
         });
       }
     });
+}
 
-  ws.on("message", (raw) => {
-    applyInboundFrame(raw.toString(), taskId, ptyService);
-  });
-
-  // Socket closed: detach listeners only. Deliberately do NOT kill the pty so
-  // the agent process survives terminal disconnects / reconnects.
-  const detach = (): void => {
-    offData();
-    offExit();
+/**
+ * A socket's frame writers: `send` for any pty frame (a no-op once the socket
+ * has left OPEN) and `sendOutput` for a non-empty output chunk (tagged with the
+ * task id).
+ */
+function createSender(
+  ws: WebSocket,
+  taskId: string,
+): {
+  send: (msg: PtyMessage) => void;
+  sendOutput: (data: string) => void;
+} {
+  const send = (msg: PtyMessage): void => {
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify(msg));
   };
-  ws.on("close", detach);
-  ws.on("error", detach);
+  const sendOutput = (data: string): void => {
+    if (data.length === 0) return;
+    const out: PtyOutputMsg = { type: "pty:output", taskId, data };
+    send(out);
+  };
+  return { send, sendOutput };
+}
+
+/**
+ * Forwards a task's pty exit to the client and closes the socket. An exit that
+ * fires while the replay gate is still CLOSED is buffered (via {@link onExit})
+ * so it lands after the replayed history; {@link flushBuffered} emits it once
+ * the gate opens, and {@link emit} sends an exit directly (the stored-exit case
+ * for a post-exit reconnect).
+ */
+function createExitForwarder(
+  ws: WebSocket,
+  taskId: string,
+  send: (msg: PtyMessage) => void,
+  gate: ReplayGate,
+): {
+  onExit: (exitCode: number, signal: number | null) => void;
+  emit: (msg: PtyExitMsg) => void;
+  flushBuffered: () => boolean;
+} {
+  let buffered: PtyExitMsg | null = null;
+  const emit = (msg: PtyExitMsg): void => {
+    send(msg);
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+      ws.close(1000, "pty exited");
+    }
+  };
+  const onExit = (exitCode: number, signal: number | null): void => {
+    const exit: PtyExitMsg = { type: "pty:exit", taskId, exitCode, signal };
+    if (!gate.isOpen) {
+      buffered = exit;
+      return;
+    }
+    emit(exit);
+  };
+  // Emit a buffered exit if one is held; returns whether it did (so the caller
+  // knows a live exit already took precedence over the stored-exit fallback).
+  const flushBuffered = (): boolean => {
+    if (!buffered) return false;
+    emit(buffered);
+    return true;
+  };
+  return { onExit, emit, flushBuffered };
 }
 
 /**

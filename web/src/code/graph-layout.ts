@@ -61,6 +61,56 @@ interface SimulationBodies {
   controlIds: string[];
 }
 
+/** The mutable accumulators `buildSimulationBodies` fills as it walks edges. */
+interface BodyAccumulator {
+  nodes: Node[];
+  /** Endpoint paths already turned into a node — dedupes across edges. */
+  seen: Set<string>;
+}
+
+/**
+ * Register both of an edge's endpoints as FIXED nodes, once each. Every
+ * endpoint `forceLink` names must exist as a node, even one this module never
+ * resolved to a real circle — parked at the canvas centre, fixed, so it can't
+ * drag its control point anywhere odd.
+ */
+function addEndpointNodes(
+  edge: CoEdge,
+  byPath: ReadonlyMap<string, PackedCircle>,
+  size: number,
+  acc: BodyAccumulator,
+): void {
+  for (const path of [edge.a, edge.b]) {
+    if (acc.seen.has(path)) continue;
+    acc.seen.add(path);
+    const circle = byPath.get(path);
+    acc.nodes.push({ id: path, kind: "endpoint", fx: circle?.x ?? size / 2, fy: circle?.y ?? size / 2 });
+  }
+}
+
+/**
+ * Where a control node starts: AT the edge's midpoint (a straight line,
+ * degenerate Q) with a small deterministic perpendicular offset keyed off the
+ * edge index, so parallel edges between the same crowded pair don't start (and
+ * often stay) fused. An edge with an unresolved endpoint seeds at the canvas
+ * centre with no offset.
+ */
+function seededControlPosition(
+  a: PackedCircle | undefined,
+  b: PackedCircle | undefined,
+  edgeIndex: number,
+  size: number,
+): ControlPoint {
+  if (!a || !b) return { x: size / 2, y: size / 2 };
+  const midX = (a.x + b.x) / 2;
+  const midY = (a.y + b.y) / 2;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const jitter = ((edgeIndex % 7) - 3) * 4; // -12..12px, deterministic
+  return { x: midX + (-dy / len) * jitter, y: midY + (dx / len) * jitter };
+}
+
 /**
  * Turns circles + edges into the simulation's bodies: one FIXED endpoint node
  * per distinct path (copied coordinates, `fx`/`fy` — never the circle itself)
@@ -76,51 +126,23 @@ function buildSimulationBodies(
   const byPath = new Map<string, PackedCircle>();
   for (const c of circles) byPath.set(c.node.path, c);
 
-  const nodes: Node[] = [];
-  const nodeIds = new Set<string>();
+  const acc: BodyAccumulator = { nodes: [], seen: new Set<string>() };
   const controlIds: string[] = [];
   const links: Link[] = [];
 
   edges.forEach((edge, i) => {
-    const a = byPath.get(edge.a);
-    const b = byPath.get(edge.b);
     const controlId = `__control_${i}`;
     controlIds.push(controlId);
 
-    for (const [path, circle] of [
-      [edge.a, a],
-      [edge.b, b],
-    ] as const) {
-      // Every endpoint `forceLink` names must exist as a node, even one this
-      // module never resolved to a real circle — parked at the canvas
-      // centre, fixed, so it can't drag its control point anywhere odd.
-      if (!nodeIds.has(path)) {
-        nodeIds.add(path);
-        nodes.push({ id: path, kind: "endpoint", fx: circle?.x ?? size / 2, fy: circle?.y ?? size / 2 });
-      }
-    }
+    addEndpointNodes(edge, byPath, size, acc);
 
-    // Seed the control point AT the midpoint (a straight line, degenerate Q)
-    // with a small deterministic perpendicular offset.
-    const midX = a && b ? (a.x + b.x) / 2 : size / 2;
-    const midY = a && b ? (a.y + b.y) / 2 : size / 2;
-    let ox = 0;
-    let oy = 0;
-    if (a && b) {
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const jitter = ((i % 7) - 3) * 4; // -12..12px, deterministic
-      ox = (-dy / len) * jitter;
-      oy = (dx / len) * jitter;
-    }
-
-    nodes.push({ id: controlId, kind: "control", x: midX + ox, y: midY + oy });
+    const { x, y } = seededControlPosition(byPath.get(edge.a), byPath.get(edge.b), i, size);
+    acc.nodes.push({ id: controlId, kind: "control", x, y });
     links.push({ source: controlId, target: edge.a, control: controlId });
     links.push({ source: controlId, target: edge.b, control: controlId });
   });
 
-  return { nodes, links, controlIds };
+  return { nodes: acc.nodes, links, controlIds };
 }
 
 /**

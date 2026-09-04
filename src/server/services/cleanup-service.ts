@@ -21,7 +21,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import type { Task, TaskRepo } from "../../shared/types.js";
+import type { ProjectRepo, Task, TaskRepo } from "../../shared/types.js";
 import type {
   CleanupService as ICleanupService,
   CommandRunnerService,
@@ -145,12 +145,9 @@ export class CleanupServiceImpl implements ICleanupService {
     await this.haltTaskRuntime(task, warnings);
 
     // 4. Delete Claude session transcript dir(s) for this task's session root.
-    if (task.sessionRoot) {
-      const sessionRoot = task.sessionRoot;
-      await this.step(warnings, "delete claude transcripts", async () => {
-        await this.deleteClaudeTranscripts(sessionRoot);
-      });
-    }
+    await this.stepForSessionRoot(task, warnings, "delete claude transcripts", (root) =>
+      this.deleteClaudeTranscripts(root),
+    );
 
     // 5. Per-repo worktree teardown. NESTING: deeper paths first, so removing
     //    an outer tree never orphans an inner one's git admin files.
@@ -162,12 +159,9 @@ export class CleanupServiceImpl implements ICleanupService {
     //    empty session root and its empty <base>/<projectName> parent dir.
     //    Unlinking a symlink removes the LINK only — never the per-project
     //    config source (e.g. the user's shared-org .claude) it points at.
-    if (task.sessionRoot) {
-      const sessionRoot = task.sessionRoot;
-      await this.step(warnings, "remove session root", async () => {
-        await this.removeSessionRootScratch(sessionRoot);
-      });
-    }
+    await this.stepForSessionRoot(task, warnings, "remove session root", (root) =>
+      this.removeSessionRootScratch(root),
+    );
 
     // 7. Delete DB rows (children first, then the task).
     await this.step(warnings, "delete task_repos rows", () => {
@@ -272,48 +266,16 @@ export class CleanupServiceImpl implements ICleanupService {
     // Run the user-defined teardown script FIRST, while the worktree files
     // still exist (the script may stop a docker compose, drop a test DB, kill
     // an external daemon, remove a named volume, deregister a service, …).
-    // A failure is downgraded to a warning so it never blocks removal.
-    if (projectRepo?.teardownScript && projectRepo.teardownScript.trim()) {
-      const script = projectRepo.teardownScript;
-      await this.step(
-        warnings,
-        `teardown script (${repo.repoName})`,
-        async () => {
-          await this.runRepoScript(script, repo.worktreePath, task.port);
-        },
-      );
-    }
+    await this.runTeardownScript(projectRepo ?? null, repo, task, warnings);
 
     // Unlock first (best-effort) so a stale lock from a crash doesn't block us.
-    await this.step(warnings, `unlock worktree ${repo.worktreePath}`, async () => {
-      await this.unlockWorktree(repo.worktreePath);
-    });
+    await this.step(warnings, `unlock worktree ${repo.worktreePath}`, () =>
+      this.unlockWorktree(repo.worktreePath),
+    );
 
     // Busy-guard: never force-remove a tree another tool may be holding open.
-    let busy = false;
-    try {
-      busy = await this.git.isWorktreeBusy(repo.worktreePath);
-    } catch (err) {
-      // If we cannot even determine busyness, treat as busy and skip — the
-      // conservative choice protects against corruption.
-      busy = true;
-      warnings.push(
-        `could not check busyness of ${repo.worktreePath}: ${errMsg(err)} (skipping removal)`,
-      );
-    }
-
-    if (busy) {
-      this.log.warn(
-        `worktree busy, SKIPPING force-removal: ${repo.worktreePath} (${repo.repoName})`,
-      );
-      warnings.push(`worktree busy, skipped: ${repo.worktreePath}`);
-      // Still attempt a prune so we don't leave stale admin entries, but do
-      // NOT touch the branch — the busy tree likely still has it checked out.
-      if (repoPath) {
-        await this.step(warnings, `prune ${repoPath}`, () =>
-          this.git.pruneWorktrees(repoPath),
-        );
-      }
+    if (await this.isWorktreeBusyGuarded(repo.worktreePath, warnings)) {
+      await this.skipBusyWorktree(repo, repoPath, warnings);
       return;
     }
 
@@ -327,6 +289,67 @@ export class CleanupServiceImpl implements ICleanupService {
     } else {
       warnings.push(
         `could not resolve source repo path for ${repo.repoName} (${repo.projectRepoId}); skipped branch/prune`,
+      );
+    }
+  }
+
+  /**
+   * Run the repo's user-defined teardown script, if one is configured, inside
+   * the worktree while its files still exist. A failure is downgraded to a
+   * warning so it never blocks the removal that follows. No-op when the repo
+   * has no non-blank teardown script.
+   */
+  private async runTeardownScript(
+    projectRepo: ProjectRepo | null,
+    repo: TaskRepo,
+    task: Task,
+    warnings: string[],
+  ): Promise<void> {
+    if (!projectRepo?.teardownScript || !projectRepo.teardownScript.trim()) {
+      return;
+    }
+    const script = projectRepo.teardownScript;
+    await this.step(warnings, `teardown script (${repo.repoName})`, () =>
+      this.runRepoScript(script, repo.worktreePath, task.port),
+    );
+  }
+
+  /**
+   * Ask the busy-guard whether the worktree is held open by another tool. If
+   * the check itself throws we cannot tell, so we conservatively report BUSY
+   * (and warn): skipping removal protects against corrupting a live tree.
+   */
+  private async isWorktreeBusyGuarded(
+    worktreePath: string,
+    warnings: string[],
+  ): Promise<boolean> {
+    try {
+      return await this.git.isWorktreeBusy(worktreePath);
+    } catch (err) {
+      warnings.push(
+        `could not check busyness of ${worktreePath}: ${errMsg(err)} (skipping removal)`,
+      );
+      return true;
+    }
+  }
+
+  /**
+   * Handle a worktree the busy-guard flagged: log + record the skip, and still
+   * attempt a prune so we don't leave stale admin entries — but do NOT touch
+   * the branch, which the busy tree likely still has checked out.
+   */
+  private async skipBusyWorktree(
+    repo: TaskRepo,
+    repoPath: string | null,
+    warnings: string[],
+  ): Promise<void> {
+    this.log.warn(
+      `worktree busy, SKIPPING force-removal: ${repo.worktreePath} (${repo.repoName})`,
+    );
+    warnings.push(`worktree busy, skipped: ${repo.worktreePath}`);
+    if (repoPath) {
+      await this.step(warnings, `prune ${repoPath}`, () =>
+        this.git.pruneWorktrees(repoPath),
       );
     }
   }
@@ -501,15 +524,7 @@ export class CleanupServiceImpl implements ICleanupService {
 
     // We don't have the TaskRepo row for an orphan, so synthesise the minimal
     // shape removeTaskWorktrees needs (it works off worktreePath).
-    const synthetic: TaskRepo = {
-      id: "",
-      taskId: "",
-      projectRepoId: "",
-      repoName: path.basename(wtPath),
-      branchName: "",
-      worktreePath: wtPath,
-      remotePushed: false,
-    };
+    const synthetic = syntheticOrphanRepo(wtPath);
     try {
       await this.git.removeTaskWorktrees([synthetic]);
       result.removedWorktrees.push(wtPath);
@@ -599,6 +614,23 @@ export class CleanupServiceImpl implements ICleanupService {
       warnings.push(`${label}: ${errMsg(err)}`);
       this.log.warn(`${label}: ${errMsg(err)}`);
     }
+  }
+
+  /**
+   * Run a best-effort {@link step} that operates on the task's session root,
+   * skipping entirely when the task has none. Folds the repeated
+   * `if (task.sessionRoot)` guard so each caller reads as a single labelled step
+   * in the teardown checklist.
+   */
+  private async stepForSessionRoot(
+    task: Task,
+    warnings: string[],
+    label: string,
+    fn: (sessionRoot: string) => void | Promise<void>,
+  ): Promise<void> {
+    if (!task.sessionRoot) return;
+    const sessionRoot = task.sessionRoot;
+    await this.step(warnings, label, () => fn(sessionRoot));
   }
 
   /**
@@ -965,6 +997,23 @@ function collectLiveSessionRoots(tasks: Task[]): Set<string> {
 /** Depth of a path (number of separated segments). */
 function pathDepth(p: string): number {
   return path.resolve(p).split(path.sep).filter(Boolean).length;
+}
+
+/**
+ * The minimal synthetic {@link TaskRepo} an orphan sweep hands to
+ * `removeTaskWorktrees`, which works purely off `worktreePath`. There is no DB
+ * row for an orphan, so every other field is an empty placeholder.
+ */
+function syntheticOrphanRepo(wtPath: string): TaskRepo {
+  return {
+    id: "",
+    taskId: "",
+    projectRepoId: "",
+    repoName: path.basename(wtPath),
+    branchName: "",
+    worktreePath: wtPath,
+    remotePushed: false,
+  };
 }
 
 /**

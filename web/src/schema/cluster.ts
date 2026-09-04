@@ -191,6 +191,56 @@ function neighborCommunityWeights(
 }
 
 /**
+ * Reubica UN nodo en la comunidad vecina que más sube la modularidad (o lo
+ * deja donde está si ninguna mejora), actualizando `community` y los totales
+ * `commTotal` in situ. Las candidatas se evalúan en orden alfabético fijo y el
+ * desempate estricto (`>` con margen 1e-12) prefiere la primera en ese orden,
+ * así que la decisión no depende del orden de iteración de ningún Map.
+ * Devuelve true si el nodo terminó en una comunidad distinta de la de entrada.
+ */
+function moveNodeToBestCommunity(
+  graph: LevelGraph,
+  community: Map<string, string>,
+  commTotal: Map<string, number>,
+  node: string,
+  settings: LouvainSettings
+): boolean {
+  // graph.totalWeight (2m) es > 0: el caller corta antes de entrar acá si es 0.
+  const m2 = graph.totalWeight;
+  const curComm = community.get(node)!;
+  const kNode = graph.nodeWeight.get(node)!;
+
+  // sacar temporalmente al nodo de su comunidad actual
+  commTotal.set(curComm, (commTotal.get(curComm) ?? 0) - kNode);
+
+  const neighborWeight = neighborCommunityWeights(graph, community, node);
+
+  // candidatas: comunidad actual + comunidades vecinas, en orden alfabético
+  const candidates = new Set<string>(neighborWeight.keys());
+  candidates.add(curComm);
+  const sortedCandidates = Array.from(candidates).sort();
+
+  let bestComm = curComm;
+  let bestGain = -Infinity;
+  for (const c of sortedCandidates) {
+    const kIn = neighborWeight.get(c) ?? 0;
+    const sigmaTot = commTotal.get(c) ?? 0;
+    const gain = kIn - (settings.resolution * sigmaTot * kNode) / m2;
+    // desempate determinista: en igualdad estricta, se prefiere la
+    // comunidad ya visitada primero en orden alfabético (sortedCandidates
+    // ya garantiza eso al usar '>' estricto, no '>=')
+    if (gain > bestGain + 1e-12) {
+      bestGain = gain;
+      bestComm = c;
+    }
+  }
+
+  commTotal.set(bestComm, (commTotal.get(bestComm) ?? 0) + kNode);
+  community.set(node, bestComm);
+  return bestComm !== curComm;
+}
+
+/**
  * Una "pasada de nivel": mueve nodos entre comunidades mientras mejore la
  * modularidad, visitando siempre los nodos en orden alfabético fijo (nunca
  * el orden de inserción de un Map/Set ni un orden aleatorio).
@@ -210,51 +260,18 @@ function runLocalMoving(
     commTotal.set(c, (commTotal.get(c) ?? 0) + graph.nodeWeight.get(n)!);
   }
 
-  let anyChangeEver = false;
-  const m2 = graph.totalWeight;
-  if (m2 === 0) return { community, changed: false };
+  if (graph.totalWeight === 0) return { community, changed: false };
 
+  let anyChangeEver = false;
   for (let pass = 0; pass < settings.maxPassesPerLevel; pass++) {
     let improved = false;
-
     for (const node of graph.nodes) {
       // graph.nodes ya está ordenado alfabéticamente de forma fija
-      const curComm = community.get(node)!;
-      const kNode = graph.nodeWeight.get(node)!;
-
-      // sacar temporalmente al nodo de su comunidad actual
-      commTotal.set(curComm, (commTotal.get(curComm) ?? 0) - kNode);
-
-      const neighborWeight = neighborCommunityWeights(graph, community, node);
-
-      // candidatas: comunidad actual + comunidades vecinas, en orden alfabético
-      const candidates = new Set<string>(neighborWeight.keys());
-      candidates.add(curComm);
-      const sortedCandidates = Array.from(candidates).sort();
-
-      let bestComm = curComm;
-      let bestGain = -Infinity;
-      for (const c of sortedCandidates) {
-        const kIn = neighborWeight.get(c) ?? 0;
-        const sigmaTot = commTotal.get(c) ?? 0;
-        const gain = kIn - (settings.resolution * sigmaTot * kNode) / m2;
-        // desempate determinista: en igualdad estricta, se prefiere la
-        // comunidad ya visitada primero en orden alfabético (sortedCandidates
-        // ya garantiza eso al usar '>' estricto, no '>=')
-        if (gain > bestGain + 1e-12) {
-          bestGain = gain;
-          bestComm = c;
-        }
-      }
-
-      commTotal.set(bestComm, (commTotal.get(bestComm) ?? 0) + kNode);
-      community.set(node, bestComm);
-      if (bestComm !== curComm) {
+      if (moveNodeToBestCommunity(graph, community, commTotal, node, settings)) {
         improved = true;
         anyChangeEver = true;
       }
     }
-
     if (!improved) break;
   }
 

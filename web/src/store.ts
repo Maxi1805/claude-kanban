@@ -169,11 +169,7 @@ export const useBoardStore = defineStore("board", {
      */
     async deleteProject(projectId: string): Promise<void> {
       await api.deleteProject(projectId);
-      this.projects = this.projects.filter((p) => p.id !== projectId);
-      this.tasks = this.tasks.filter((t) => t.projectId !== projectId);
-      if (this.selectedProjectId === projectId) {
-        this.selectedProjectId = this.projects[0]?.id ?? null;
-      }
+      this.removeProjectFromState(projectId);
     },
 
     async addRepo(projectId: string, dto: AddRepoDTO): Promise<Project> {
@@ -284,7 +280,7 @@ export const useBoardStore = defineStore("board", {
     /** Delete a task — triggers the backend teardown (worktrees, pty, branches). */
     async deleteTask(taskId: string): Promise<void> {
       await api.deleteTask(taskId);
-      this.tasks = this.tasks.filter((t) => t.id !== taskId);
+      this.removeTaskFromState(taskId);
     },
 
     /* ── Local reconciliation helpers ─────────────────────────────── */
@@ -299,6 +295,28 @@ export const useBoardStore = defineStore("board", {
       const i = this.tasks.findIndex((t) => t.id === task.id);
       if (i === -1) this.tasks.push(task);
       else this.tasks[i] = task;
+    },
+
+    /**
+     * Drop a task from local state by id. Shared by {@link deleteTask} and the
+     * `task:deleted` board event so both reconcile identically.
+     */
+    removeTaskFromState(taskId: string): void {
+      this.tasks = this.tasks.filter((t) => t.id !== taskId);
+    },
+
+    /**
+     * Drop a project and its tasks from local state, reselecting the first
+     * remaining project if the deleted one was active. Shared by
+     * {@link deleteProject} and the `project:deleted` board event so both
+     * reconcile identically.
+     */
+    removeProjectFromState(projectId: string): void {
+      this.projects = this.projects.filter((p) => p.id !== projectId);
+      this.tasks = this.tasks.filter((t) => t.projectId !== projectId);
+      if (this.selectedProjectId === projectId) {
+        this.selectedProjectId = this.projects[0]?.id ?? null;
+      }
     },
 
     /* ── Live websocket events ────────────────────────────────────── */
@@ -348,22 +366,14 @@ export const useBoardStore = defineStore("board", {
           if (event.task) this.upsertTask(event.task);
           break;
         case "task:deleted":
-          if (event.taskId) {
-            this.tasks = this.tasks.filter((t) => t.id !== event.taskId);
-          }
+          if (event.taskId) this.removeTaskFromState(event.taskId);
           break;
         case "project:created":
         case "project:updated":
           if (event.project) this.upsertProject(event.project);
           break;
         case "project:deleted":
-          if (event.projectId) {
-            this.projects = this.projects.filter((p) => p.id !== event.projectId);
-            this.tasks = this.tasks.filter((t) => t.projectId !== event.projectId);
-            if (this.selectedProjectId === event.projectId) {
-              this.selectedProjectId = this.projects[0]?.id ?? null;
-            }
-          }
+          if (event.projectId) this.removeProjectFromState(event.projectId);
           break;
       }
     },

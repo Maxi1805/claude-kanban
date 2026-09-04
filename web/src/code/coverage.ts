@@ -117,16 +117,22 @@ export interface BlindSpotSummary {
 }
 
 export function blindSpotSummary(coverage: readonly CodeDetectorCoverage[]): BlindSpotSummary {
-  const summary = { conHallazgos: 0, sinHallazgos: 0, noAplicable: 0, bloqueado: 0, error: 0 };
-  for (const row of coverage) {
-    const bucket = bucketOf(row);
-    if (bucket === "con-hallazgos") summary.conHallazgos += 1;
-    else if (bucket === "sin-hallazgos") summary.sinHallazgos += 1;
-    else if (bucket === "no-aplicable") summary.noAplicable += 1;
-    else if (bucket === "bloqueado") summary.bloqueado += 1;
-    else summary.error += 1;
-  }
-  return { ...summary, total: coverage.length };
+  const counts: Record<CoverageBucket, number> = {
+    "con-hallazgos": 0,
+    "sin-hallazgos": 0,
+    "no-aplicable": 0,
+    bloqueado: 0,
+    error: 0,
+  };
+  for (const row of coverage) counts[bucketOf(row)] += 1;
+  return {
+    conHallazgos: counts["con-hallazgos"],
+    sinHallazgos: counts["sin-hallazgos"],
+    noAplicable: counts["no-aplicable"],
+    bloqueado: counts.bloqueado,
+    error: counts.error,
+    total: coverage.length,
+  };
 }
 
 /**
@@ -147,51 +153,6 @@ export function blindSpotLine(summary: BlindSpotSummary): string {
 export function missingCapabilitiesText(row: CodeDetectorCoverage): string | null {
   if (!row.missingCapabilities || row.missingCapabilities.length === 0) return null;
   return `falta: ${row.missingCapabilities.join(", ")}`;
-}
-
-/**
- * CONTRATO-F6.md Contrato 2 §2.5 — cuántos archivos de cada lenguaje vio el
- * corpus EXTERNO que valida los detectores (medido en esta tarea sobre
- * `revision2/corpus`, 8 repos, `find` excluyendo `node_modules`/`.git`). NO
- * es el tamaño del repo que el usuario está analizando ahora — es la
- * confianza que el PRODUCTO tiene en ese lenguaje en general. Java tiene acá
- * 170 veces más archivos que tsx: "funciona genéricamente" hoy se apoya casi
- * enteramente en java (ver el informe de `language-coverage.test.ts` para el
- * número exacto de dependencia).
- */
-export const CORPUS_SAMPLE_FILES: Readonly<Record<string, number>> = {
-  java: 3229,
-  csharp: 945,
-  typescript: 698,
-  vue: 213,
-  ruby: 161,
-  javascript: 159,
-  python: 78,
-  go: 36,
-  tsx: 19,
-};
-
-/**
- * `[provisional]` — mismo piso que `detect/language-coverage.ts
- * #MEASUREMENT_FLOOR_FILES` (server-only, no importable desde el frontend):
- * duplicado a propósito, no un archivo compartido nuevo. Ver CONTRATO-F6.md
- * §2.5: no re-derivado por remuestreo en esta tarea.
- */
-export const MEASUREMENT_FLOOR_FILES = 150;
-
-/**
- * `null` cuando el lenguaje no es uno de los 9 medidos, o cuando su muestra
- * ya supera el piso — la lectura honesta pedida por la tarea: un lenguaje
- * bajo el piso no se pinta verde ni rojo, se marca "no lo sabemos todavía".
- */
-export function sampleConfidenceNote(language: string): string | null {
-  const sampleSize = CORPUS_SAMPLE_FILES[language];
-  if (sampleSize === undefined || sampleSize >= MEASUREMENT_FLOOR_FILES) return null;
-  return (
-    `Muestra insuficiente en el corpus de validación: sólo ${sampleSize} archivo` +
-    `${sampleSize === 1 ? "" : "s"} de ${language}. Sobre este lenguaje el sistema no puede ` +
-    "afirmar cobertura todavía — ni verde ni rojo, desconocido."
-  );
 }
 
 /**

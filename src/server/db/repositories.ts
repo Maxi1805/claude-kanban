@@ -244,6 +244,25 @@ type ProjectPatch = {
 };
 
 /**
+ * The project's optional Claude-config paths, paired with their snake_case
+ * columns. All four are stored the same way — normalized so a blank string
+ * becomes NULL — so they drive one loop in {@link buildProjectAssignments}
+ * instead of four copies of the same `if (present) set(col, normalize(v))` line.
+ */
+const PROJECT_CONFIG_PATH_COLUMNS: readonly [
+  keyof Pick<
+    ProjectPatch,
+    "claudeConfigPath" | "claudeMdPath" | "claudeDirPath" | "mcpConfigPath"
+  >,
+  string,
+][] = [
+  ["claudeConfigPath", "claude_config_path"],
+  ["claudeMdPath", "claude_md_path"],
+  ["claudeDirPath", "claude_dir_path"],
+  ["mcpConfigPath", "mcp_config_path"],
+];
+
+/**
  * Map a project patch onto its column assignments. Only the fields the patch
  * MENTIONS are assigned (`undefined` means "leave alone", while an explicit
  * null clears the column), and each config path goes through the same
@@ -255,26 +274,11 @@ function buildProjectAssignments(patch: ProjectPatch): UpdateAssignments {
   if (patch.name !== undefined) {
     assignments.set("name", patch.name);
   }
-  if (patch.claudeConfigPath !== undefined) {
-    assignments.set(
-      "claude_config_path",
-      normalizeConfigPath(patch.claudeConfigPath),
-    );
-  }
-  if (patch.claudeMdPath !== undefined) {
-    assignments.set("claude_md_path", normalizeConfigPath(patch.claudeMdPath));
-  }
-  if (patch.claudeDirPath !== undefined) {
-    assignments.set(
-      "claude_dir_path",
-      normalizeConfigPath(patch.claudeDirPath),
-    );
-  }
-  if (patch.mcpConfigPath !== undefined) {
-    assignments.set(
-      "mcp_config_path",
-      normalizeConfigPath(patch.mcpConfigPath),
-    );
+  for (const [field, column] of PROJECT_CONFIG_PATH_COLUMNS) {
+    const value = patch[field];
+    if (value !== undefined) {
+      assignments.set(column, normalizeConfigPath(value));
+    }
   }
   if (patch.copyFiles !== undefined) {
     assignments.set("copy_files", serializeCopyFiles(patch.copyFiles));
@@ -375,6 +379,17 @@ class SqliteProjectRepository implements ProjectRepository {
  * ProjectRepoRepository
  * ──────────────────────────────────────────────────────────────────────── */
 
+/**
+ * A project repo's three lifecycle-script columns, paired with their snake_case
+ * columns. All three are normalized identically (blank string → NULL), so they
+ * drive one loop in the repo update instead of three copies of the same line.
+ */
+const REPO_SCRIPT_COLUMNS: readonly [keyof UpdateRepoDTO, string][] = [
+  ["setupScript", "setup_script"],
+  ["runScript", "run_script"],
+  ["teardownScript", "teardown_script"],
+];
+
 class SqliteProjectRepoRepository implements ProjectRepoRepository {
   constructor(private readonly db: DB) {}
 
@@ -420,17 +435,11 @@ class SqliteProjectRepoRepository implements ProjectRepoRepository {
   update(repoId: string, patch: UpdateRepoDTO): ProjectRepo | null {
     const assignments = new UpdateAssignments();
 
-    if (patch.setupScript !== undefined) {
-      assignments.set("setup_script", normalizeConfigPath(patch.setupScript));
-    }
-    if (patch.runScript !== undefined) {
-      assignments.set("run_script", normalizeConfigPath(patch.runScript));
-    }
-    if (patch.teardownScript !== undefined) {
-      assignments.set(
-        "teardown_script",
-        normalizeConfigPath(patch.teardownScript),
-      );
+    for (const [field, column] of REPO_SCRIPT_COLUMNS) {
+      const value = patch[field];
+      if (value !== undefined) {
+        assignments.set(column, normalizeConfigPath(value));
+      }
     }
 
     if (assignments.isEmpty) {
@@ -458,71 +467,78 @@ class SqliteProjectRepoRepository implements ProjectRepoRepository {
  * ──────────────────────────────────────────────────────────────────────── */
 
 /**
+ * The status column to actually write for a task patch, enforcing the
+ * working ⇒ running invariant: a task whose live agent becomes "working" MUST
+ * live in the "running" column.
+ *
+ * Enforced here, in the single update chokepoint, so EVERY caller (lifecycle
+ * create/respawn, the agent-events activity hook) gets the auto-move for free
+ * without each remembering to set status. We only force the move when the SAME
+ * patch does not already set an explicit status — an explicit `patch.status`
+ * always wins (so a caller can still write {agentState:"working",
+ * status:"review"} deliberately). Note we do NOT clear agentState when status
+ * flips to a non-running value: display gating hides it instead, which avoids an
+ * erratic move↔re-work fight where a manual drag would yank the card back.
+ * Because every "working" write is a no-op when the state is unchanged (callers
+ * guard with `if (task.agentState === state) return;` before calling update), a
+ * card manually dragged out of "running" while already "working" is never
+ * re-forced back — only a fresh waiting→working transition (a new turn) reaches
+ * here and moves it.
+ */
+function resolveEffectiveStatus(patch: TaskPatch): TaskStatus | undefined {
+  return patch.agentState === "working" && patch.status === undefined
+    ? "running"
+    : patch.status;
+}
+
+/**
+ * The task columns whose patch value is stored VERBATIM, paired with their
+ * snake_case column. They drive one loop in {@link buildTaskAssignments} instead
+ * of ten copies of the same `if (present) set(col, value)` line. The columns
+ * that need a transform — `status` (the working ⇒ running invariant) and the
+ * SQLite-boolean caveman flags — are handled explicitly there, not here.
+ */
+const TASK_PASSTHROUGH_COLUMNS: readonly [keyof TaskPatch, string][] = [
+  ["title", "title"],
+  ["description", "description"],
+  ["slug", "slug"],
+  ["sessionRoot", "session_root"],
+  ["ptyPid", "pty_pid"],
+  ["claudeSessionId", "claude_session_id"],
+  ["port", "port"],
+  ["agentState", "agent_state"],
+  ["agentStateAt", "agent_state_at"],
+  ["cavemanLevel", "caveman_level"],
+];
+
+/**
  * Map a task patch onto its column assignments — only the fields the patch
- * MENTIONS — and enforce the working ⇒ running invariant while doing it. Booleans
- * are stored as 0/1, and `cavemanSession` keeps its third state (null = "no
- * session has spawned yet") instead of collapsing to 0.
+ * MENTIONS — enforcing the working ⇒ running invariant via
+ * {@link resolveEffectiveStatus}. Booleans are stored as 0/1, and
+ * `cavemanSession` keeps its third state (null = "no session has spawned yet")
+ * instead of collapsing to 0.
  *
  * The `updated_at` stamp is NOT set here: the caller adds it only when there is
  * something to update, so a no-op patch does not touch the row.
  */
 function buildTaskAssignments(patch: TaskPatch): UpdateAssignments {
-  // INVARIANT (working ⇒ running): a task whose live agent becomes "working"
-  // MUST live in the "running" column. Enforced here, in the single update
-  // chokepoint, so EVERY caller (lifecycle create/respawn, the agent-events
-  // activity hook) gets the auto-move for free without each remembering to set
-  // status. We only force the move when the SAME patch does not already set an
-  // explicit status — an explicit `patch.status` always wins (so a caller can
-  // still write {agentState:"working", status:"review"} deliberately). Note we
-  // do NOT clear agentState when status flips to a non-running value: display
-  // gating hides it instead, which avoids an erratic move↔re-work fight where a
-  // manual drag would yank the card back. Because every "working" write is a
-  // no-op when the state is unchanged (callers guard with `if (task.agentState
-  // === state) return;` before calling update), a card manually dragged out of
-  // "running" while already "working" is never re-forced back — only a fresh
-  // waiting→working transition (a new turn) reaches here and moves it.
-  const effectiveStatus =
-    patch.agentState === "working" && patch.status === undefined
-      ? "running"
-      : patch.status;
-
   const assignments = new UpdateAssignments();
 
-  if (patch.title !== undefined) {
-    assignments.set("title", patch.title);
-  }
-  if (patch.description !== undefined) {
-    assignments.set("description", patch.description);
-  }
+  const effectiveStatus = resolveEffectiveStatus(patch);
   if (effectiveStatus !== undefined) {
     assignments.set("status", effectiveStatus);
   }
-  if (patch.slug !== undefined) {
-    assignments.set("slug", patch.slug);
+
+  for (const [field, column] of TASK_PASSTHROUGH_COLUMNS) {
+    const value = patch[field];
+    if (value !== undefined) {
+      assignments.set(column, value);
+    }
   }
-  if (patch.sessionRoot !== undefined) {
-    assignments.set("session_root", patch.sessionRoot);
-  }
-  if (patch.ptyPid !== undefined) {
-    assignments.set("pty_pid", patch.ptyPid);
-  }
-  if (patch.claudeSessionId !== undefined) {
-    assignments.set("claude_session_id", patch.claudeSessionId);
-  }
-  if (patch.port !== undefined) {
-    assignments.set("port", patch.port);
-  }
-  if (patch.agentState !== undefined) {
-    assignments.set("agent_state", patch.agentState);
-  }
-  if (patch.agentStateAt !== undefined) {
-    assignments.set("agent_state_at", patch.agentStateAt);
-  }
+
+  // SQLite has no boolean type: the caveman flags are stored as 0/1.
   if (patch.cavemanEnabled !== undefined) {
     assignments.set("caveman_enabled", patch.cavemanEnabled ? 1 : 0);
-  }
-  if (patch.cavemanLevel !== undefined) {
-    assignments.set("caveman_level", patch.cavemanLevel);
   }
   if (patch.cavemanSession !== undefined) {
     assignments.set(

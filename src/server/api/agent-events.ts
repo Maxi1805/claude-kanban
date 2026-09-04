@@ -161,17 +161,20 @@ export function createAgentEventsRouter(deps: AgentEventsRouterDeps): Router {
  *     body arrives pre-parsed and must be used as-is, not re-stringified.
  */
 function parseHookBody(raw: unknown): HookEventBody {
-  if (typeof raw === "string") {
-    if (raw.length === 0) return {};
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      return parsed && typeof parsed === "object" ? (parsed as HookEventBody) : {};
-    } catch {
-      return {};
-    }
+  // Parse a string shape ourselves; an already-parsed object passes through.
+  // Only a real object survives the guard — anything else degrades to {}.
+  const value = typeof raw === "string" ? tryParseJson(raw) : raw;
+  return value && typeof value === "object" ? (value as HookEventBody) : {};
+}
+
+/** JSON.parse that never throws: empty input or a parse error yields null. */
+function tryParseJson(raw: string): unknown {
+  if (raw.length === 0) return null;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return null;
   }
-  // Already parsed by an upstream JSON body parser (e.g. express.json()).
-  return raw && typeof raw === "object" ? (raw as HookEventBody) : {};
 }
 
 /**

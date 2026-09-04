@@ -24,7 +24,7 @@
  * Relations are drawn child → parent: the entity holding the foreign key is on
  * the "many" end, so a glance shows which side owns the reference.
  */
-import type { SchemaDiff, SchemaGraph, SchemaRelation } from "@/types";
+import type { SchemaDiff, SchemaEntity, SchemaField, SchemaGraph, SchemaRelation } from "@/types";
 import type { SchemaGroup } from "./grouping";
 
 /** Visual state of an element in the diagram. */
@@ -94,17 +94,79 @@ interface RenderedEntities {
 }
 
 /**
+ * Todo lo invariante que comparten las funciones de render de un diagrama: el
+ * grafo que se dibuja, su diff (de donde salen notas y resaltados) y CÓMO se
+ * dibuja —las opciones y si quedó el modo agrupado (class, con namespaces) o
+ * el ER—. Es el mismo cuarteto que atravesaba `renderEntities`,
+ * `renderEntityLines`, `renderFieldLine`, `renderRelations` y `relationLine`
+ * como parámetros sueltos y consecutivos; viaja junto porque es un solo
+ * concepto: el diagrama-en-construcción y su modo.
+ */
+interface RenderContext {
+  graph: SchemaGraph;
+  diff: SchemaDiff | undefined;
+  options: DiagramOptions;
+  /** class diagram (namespaces) vs ER — ya resuelto por {@link buildDiagram}. */
+  grouped: boolean;
+}
+
+/**
+ * Una línea de columna: tipo, nombre, marcadores PK/FK y, en su caso, la nota
+ * de cambio. El slot para la nota difiere por gramática — un comentario entre
+ * comillas en ER, y un `<< … >>` pegado al nombre en class (los miembros de
+ * clase no tienen slot de comentario).
+ */
+function renderFieldLine(
+  ctx: RenderContext,
+  entity: SchemaEntity,
+  field: SchemaField,
+  indent: string,
+): string {
+  const keys: string[] = [];
+  if (field.primaryKey) keys.push("PK");
+  if (ctx.graph.relations.some((r) => r.from === entity.name && r.fromField === field.name)) {
+    keys.push("FK");
+  }
+  const note = fieldNote(entity.name, field.name, field.pending, ctx.diff);
+  const type = renderName(field.type || "text");
+  const fieldName = renderName(field.name);
+  return ctx.grouped
+    ? `${indent}  +${type} ${fieldName}${keys.length ? ` ${keys.join(",")}` : ""}` +
+        `${note ? ` << ${note} >>` : ""}`
+    : `${indent}  ${type} ${fieldName}` +
+        `${keys.length ? ` ${keys.join(",")}` : ""}${note ? ` "${note}"` : ""}`;
+}
+
+/**
+ * El bloque de UNA entidad: la caja rotulada y, si `showFields`, sus columnas.
+ * Sin columnas sigue siendo una caja con nombre. `id` es el nombre ya
+ * saneado para Mermaid.
+ */
+function renderEntityLines(
+  ctx: RenderContext,
+  entity: SchemaEntity,
+  id: string,
+  indent: string,
+): string[] {
+  const open = ctx.grouped ? `${indent}class ${id} {` : `${indent}${id} {`;
+  if (!ctx.options.showFields) {
+    // An entity with no member block still renders as a labelled box.
+    return [open, `${indent}}`];
+  }
+  const lines = [open];
+  for (const field of entity.fields) {
+    lines.push(renderFieldLine(ctx, entity, field, indent));
+  }
+  lines.push(`${indent}}`);
+  return lines;
+}
+
+/**
  * Emite el bloque de cada entidad visible — en modo agrupado, dentro del
  * `namespace` de su tema, tema por tema para que cada caja quede contigua;
  * en modo ER, en el orden propio del grafo.
  */
-function renderEntities(
-  graph: SchemaGraph,
-  visible: Set<string>,
-  diff: SchemaDiff | undefined,
-  options: DiagramOptions,
-  grouped: boolean,
-): RenderedEntities {
+function renderEntities(ctx: RenderContext, visible: Set<string>): RenderedEntities {
   const lines: string[] = [];
   const entityHighlights = new Map<string, HighlightKind>();
   const originalNames = new Map<string, string>();
@@ -115,44 +177,17 @@ function renderEntities(
     if (name !== null) lines.push(`  namespace ${namespaceId(name)} {`);
   };
 
-  for (const [groupName, entities] of entityBuckets(graph, visible, options, grouped)) {
+  for (const [groupName, entities] of entityBuckets(ctx.graph, visible, ctx.options, ctx.grouped)) {
     openNamespace(groupName);
     const indent = groupName === null ? "  " : "    ";
     for (const entity of entities) {
       const id = renderName(entity.name);
       originalNames.set(id, entity.name);
 
-      const highlight = entityHighlight(entity.name, entity.pending, diff);
+      const highlight = entityHighlight(entity.name, entity.pending, ctx.diff);
       if (highlight) entityHighlights.set(id, highlight);
 
-      const open = grouped ? `${indent}class ${id} {` : `${indent}${id} {`;
-      if (!options.showFields) {
-        // An entity with no member block still renders as a labelled box.
-        lines.push(open, `${indent}}`);
-        continue;
-      }
-
-      lines.push(open);
-      for (const field of entity.fields) {
-        const keys: string[] = [];
-        if (field.primaryKey) keys.push("PK");
-        if (graph.relations.some((r) => r.from === entity.name && r.fromField === field.name)) {
-          keys.push("FK");
-        }
-        const note = fieldNote(entity.name, field.name, field.pending, diff);
-        const type = renderName(field.type || "text");
-        const fieldName = renderName(field.name);
-        lines.push(
-          grouped
-            ? // Class members carry no comment slot, so a change marker is
-              // appended to the name instead.
-              `${indent}  +${type} ${fieldName}${keys.length ? ` ${keys.join(",")}` : ""}` +
-                `${note ? ` << ${note} >>` : ""}`
-            : `${indent}  ${type} ${fieldName}` +
-                `${keys.length ? ` ${keys.join(",")}` : ""}${note ? ` "${note}"` : ""}`,
-        );
-      }
-      lines.push(`${indent}}`);
+      lines.push(...renderEntityLines(ctx, entity, id, indent));
     }
     if (groupName !== null) lines.push("  }");
   }
@@ -168,26 +203,36 @@ interface RenderedRelations {
 }
 
 /**
+ * La línea de UNA relación, dibujada hijo → padre. En class no hay
+ * cardinalidad (sólo la flecha); en ER, la punta del padre codifica si la FK
+ * es opcional ("cero o uno") u obligatoria ("exactamente uno").
+ */
+function relationLine(ctx: RenderContext, relation: SchemaRelation): string {
+  if (ctx.grouped) {
+    // No cardinality in a class diagram: the arrow still points child → parent.
+    return `  ${renderName(relation.from)} --> ${renderName(relation.to)} : ${relation.fromField}`;
+  }
+  // Optional FK → "zero or one" parent; required FK → "exactly one".
+  const parentEnd = isOptional(ctx.graph, relation) ? "o|" : "||";
+  return `  ${renderName(relation.from)} }o--${parentEnd} ${renderName(relation.to)} : "${relation.fromField}"`;
+}
+
+/**
  * Emite las relaciones entre entidades visibles, en el orden de declaración
  * del grafo — ese orden ES el índice de arista con el que `applyHighlights`
  * encuentra cada `path` en el SVG, así que no se puede reordenar.
  */
-function renderRelations(
-  graph: SchemaGraph,
-  visible: Set<string>,
-  diff: SchemaDiff | undefined,
-  grouped: boolean,
-): RenderedRelations {
+function renderRelations(ctx: RenderContext, visible: Set<string>): RenderedRelations {
   const lines: string[] = [];
   const relationHighlights = new Map<number, HighlightKind>();
   const selfRelationHighlights = new Map<string, HighlightKind>();
   const selfRelationCount = new Map<string, number>();
 
   let edgeIndex = 0;
-  for (const relation of graph.relations) {
+  for (const relation of ctx.graph.relations) {
     if (!visible.has(relation.from) || !visible.has(relation.to)) continue;
 
-    const highlight = relationHighlight(relation, diff);
+    const highlight = relationHighlight(relation, ctx.diff);
     if (highlight) relationHighlights.set(edgeIndex, highlight);
 
     if (relation.from === relation.to) {
@@ -196,18 +241,7 @@ function renderRelations(
       if (highlight) selfRelationHighlights.set(id, highlight);
     }
 
-    if (grouped) {
-      // No cardinality in a class diagram: the arrow still points child → parent.
-      lines.push(
-        `  ${renderName(relation.from)} --> ${renderName(relation.to)} : ${relation.fromField}`,
-      );
-    } else {
-      // Optional FK → "zero or one" parent; required FK → "exactly one".
-      const parentEnd = isOptional(graph, relation) ? "o|" : "||";
-      lines.push(
-        `  ${renderName(relation.from)} }o--${parentEnd} ${renderName(relation.to)} : "${relation.fromField}"`,
-      );
-    }
+    lines.push(relationLine(ctx, relation));
     edgeIndex++;
   }
 
@@ -231,11 +265,12 @@ export function buildDiagram(
   }
   const hiddenEntities = graph.entities.length - visible.size;
   const grouped = options.grouped === true && options.groupByTable !== undefined;
+  const ctx: RenderContext = { graph, diff, options, grouped };
 
-  const entities = renderEntities(graph, visible, diff, options, grouped);
+  const entities = renderEntities(ctx, visible);
   // Relations are emitted last so their edge indices are contiguous and
   // predictable for the SVG pass.
-  const relations = renderRelations(graph, visible, diff, grouped);
+  const relations = renderRelations(ctx, visible);
 
   return {
     code: [grouped ? "classDiagram" : "erDiagram", ...entities.lines, ...relations.lines].join("\n"),
@@ -345,18 +380,17 @@ function fieldNote(
 }
 
 /**
- * Which entities to draw. Unfiltered that is all of them; in "only changed"
- * mode it is everything this task touched plus one hop of context, so a new
- * relation is always shown attached to the table it points at.
+ * Las tablas que ESTA tarea tocó: las que el diff marca (o que están
+ * `pending`) como entidad, las dos puntas de cada relación cambiada, y la
+ * tabla dueña de cada columna cambiada. `all` acota a tablas que existen en
+ * el grafo actual (una columna borrada puede nombrar una tabla que ya no
+ * está).
  */
-function selectEntities(
+function collectChangedSeeds(
   graph: SchemaGraph,
   diff: SchemaDiff | undefined,
-  onlyChanged: boolean,
+  all: Set<string>,
 ): Set<string> {
-  const all = new Set(graph.entities.map((e) => e.name));
-  if (!onlyChanged) return all;
-
   const seeds = new Set<string>();
   for (const entity of graph.entities) {
     if (entity.pending || diff?.entities[entity.name]) seeds.add(entity.name);
@@ -371,7 +405,23 @@ function selectEntities(
     const entity = key.slice(0, key.lastIndexOf("."));
     if (all.has(entity)) seeds.add(entity);
   }
+  return seeds;
+}
 
+/**
+ * Which entities to draw. Unfiltered that is all of them; in "only changed"
+ * mode it is everything this task touched plus one hop of context, so a new
+ * relation is always shown attached to the table it points at.
+ */
+function selectEntities(
+  graph: SchemaGraph,
+  diff: SchemaDiff | undefined,
+  onlyChanged: boolean,
+): Set<string> {
+  const all = new Set(graph.entities.map((e) => e.name));
+  if (!onlyChanged) return all;
+
+  const seeds = collectChangedSeeds(graph, diff, all);
   if (seeds.size === 0) return new Set();
 
   // One hop out, so every seed's relations have both ends drawn.

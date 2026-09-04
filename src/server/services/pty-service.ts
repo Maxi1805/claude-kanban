@@ -179,19 +179,7 @@ export class PtyServiceImpl implements IPtyService {
       throw new Error(`A pty already exists for task ${task.id}`);
     }
 
-    // Fresh session: drop any stale exit record and truncate a leftover log so
-    // the new run does not replay a previous session's output. CRUCIAL: route the
-    // truncate through the write chain (rather than fire-and-forget) so the very
-    // first append from proc.onData→capture() is ordered AFTER the rm completes —
-    // otherwise an append racing the async rm could be silently dropped. The byte
-    // cursor restarts at 0 for the new session.
-    this.exited.delete(task.id);
-    this.logBytes.set(task.id, 0);
-    // Seed the activity clock so the monitor sees the freshly spawned agent as
-    // "working" from tick one (it has not produced output yet, but a spawn is
-    // activity). The lifecycle also calls markActivity right after spawn.
-    this.lastOutputAt.set(task.id, Date.now());
-    this.writeChains.set(task.id, this.resetLog(task.id));
+    this.beginFreshSession(task.id);
 
     const cwd = task.sessionRoot;
     const env = cleanAgentEnv();
@@ -223,24 +211,51 @@ export class PtyServiceImpl implements IPtyService {
     };
     this.ptys.set(task.id, record);
 
-    // If the agent command was unresolved, print a hint into the terminal.
-    if (command !== this.configuredCommand()) {
-      const hint =
-        `\r\n\x1b[33m[claude-kanban] "${this.configuredCommand()}" not found on PATH; ` +
-        `falling back to an interactive shell.\r\n` +
-        `Install the Claude CLI (or set CK_AGENT_COMMAND) and recreate the task ` +
-        `to launch the agent automatically.\x1b[0m\r\n`;
-      queueMicrotask(() => {
-        this.capture(task.id, hint);
-        for (const cb of record.dataListeners) cb(hint);
-      });
-    }
+    this.maybeWarnFallbackShell(record, command);
 
     this.wireProcessOutput(record);
 
     for (const cb of this.spawnListeners) cb(task.id, record.pid);
 
     return { taskId: task.id, pid: record.pid, cols, rows };
+  }
+
+  /**
+   * Reset all per-session state so a fresh spawn does not inherit the previous
+   * run's output or exit. Drops any stale exit record, restarts the byte cursor
+   * at 0, seeds the activity clock so the monitor reads the freshly spawned agent
+   * as "working" from tick one (a spawn is activity even before any output; the
+   * lifecycle also calls markActivity right after), and truncates a leftover log.
+   *
+   * CRUCIAL: the truncate is routed THROUGH the write chain (not fire-and-forget)
+   * so the very first append from proc.onData→capture() is ordered AFTER the rm
+   * completes — otherwise an append racing the async rm could be silently dropped.
+   */
+  private beginFreshSession(taskId: string): void {
+    this.exited.delete(taskId);
+    this.logBytes.set(taskId, 0);
+    this.lastOutputAt.set(taskId, Date.now());
+    this.writeChains.set(taskId, this.resetLog(taskId));
+  }
+
+  /**
+   * When `resolveCommand` fell back to an interactive shell (the configured agent
+   * was not on PATH), print a one-time hint into the terminal so the user knows
+   * why they got a bare shell and how to fix it. No-op when the configured agent
+   * did resolve. The hint is captured to disk and fanned out on a microtask, the
+   * same path live output takes, so a reconnecting terminal replays it too.
+   */
+  private maybeWarnFallbackShell(record: PtyRecord, command: string): void {
+    if (command === this.configuredCommand()) return;
+    const hint =
+      `\r\n\x1b[33m[claude-kanban] "${this.configuredCommand()}" not found on PATH; ` +
+      `falling back to an interactive shell.\r\n` +
+      `Install the Claude CLI (or set CK_AGENT_COMMAND) and recreate the task ` +
+      `to launch the agent automatically.\x1b[0m\r\n`;
+    queueMicrotask(() => {
+      this.capture(record.taskId, hint);
+      for (const cb of record.dataListeners) cb(hint);
+    });
   }
 
   /**
@@ -328,20 +343,30 @@ export class PtyServiceImpl implements IPtyService {
   }
 
   onData(taskId: string, cb: PtyDataListener): Unsubscribe {
-    const rec = this.ptys.get(taskId);
-    if (!rec) return () => {};
-    rec.dataListeners.add(cb);
-    return () => {
-      rec.dataListeners.delete(cb);
-    };
+    return this.addListener(taskId, (rec) => rec.dataListeners, cb);
   }
 
   onExit(taskId: string, cb: PtyExitListener): Unsubscribe {
+    return this.addListener(taskId, (rec) => rec.exitListeners, cb);
+  }
+
+  /**
+   * Add `cb` to one of a live pty's per-task listener sets and return an
+   * unsubscribe that removes it. No live pty → a no-op unsubscribe (nothing to
+   * subscribe to). `pick` selects which set (data vs exit) on the record; the
+   * closure captures that exact Set so unsubscribe targets the same one.
+   */
+  private addListener<L>(
+    taskId: string,
+    pick: (rec: PtyRecord) => Set<L>,
+    cb: L,
+  ): Unsubscribe {
     const rec = this.ptys.get(taskId);
     if (!rec) return () => {};
-    rec.exitListeners.add(cb);
+    const set = pick(rec);
+    set.add(cb);
     return () => {
-      rec.exitListeners.delete(cb);
+      set.delete(cb);
     };
   }
 
@@ -556,8 +581,8 @@ export class PtyServiceImpl implements IPtyService {
       const buf = Buffer.allocUnsafe(length);
       await handle.read(buf, 0, length, start);
       return buf.toString("utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    } catch {
+      // A missing file (never captured) or any read error → empty replay.
       return "";
     } finally {
       await handle?.close().catch(() => {});

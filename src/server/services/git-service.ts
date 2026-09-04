@@ -231,16 +231,8 @@ export class GitServiceImpl implements GitServiceContract {
 
   /**
    * Copy ONE concrete relative entry `rel` from `repoRoot` into `worktreeRoot`,
-   * but only after proving it cannot reach outside either root. The proof is in
-   * three layers, and the entry is skipped (with a warning where the cause is a
-   * suspicious pattern rather than a plain absence) if any of them fails:
-   *
-   *  1. LEXICAL — both resolved paths must stay within their roots.
-   *  2. EXISTENCE — `lstat` (not `access`) so a dangling or escaping symlink is
-   *     observed as itself rather than followed.
-   *  3. REAL PATH — the lexical check cannot see through symlinks, so the source's
-   *     real on-disk path is resolved and re-asserted to be inside the repo. A
-   *     symlink (file OR directory) pointing outside is rejected, never chased.
+   * but only after {@link resolveContainedSource} has proved it cannot reach
+   * outside either root (an unsafe or absent entry yields `null` and is skipped).
    *
    * The copy itself keeps `dereference: false` (+ verbatimSymlinks) so nested
    * symlinks inside a copied directory are PRESERVED, never walked into and
@@ -253,20 +245,51 @@ export class GitServiceImpl implements GitServiceContract {
     worktreeRoot: string,
     rel: string,
   ): Promise<void> {
+    const src = await this.resolveContainedSource(repoRoot, worktreeRoot, rel);
+    if (src == null) return;
+
+    const dest = path.resolve(worktreeRoot, rel);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.cp(src, dest, {
+      recursive: true,
+      dereference: false,
+      verbatimSymlinks: true,
+    });
+  }
+
+  /**
+   * Prove that `rel` maps to a source that is safe to copy — inside `repoRoot`
+   * even after symlinks are resolved, with its destination inside `worktreeRoot`
+   * — and return that source's lexical path. Returns `null` (having warned where
+   * the cause is a suspicious pattern rather than a plain absence) when any of
+   * the three containment layers fails or the entry is simply absent:
+   *
+   *  1. LEXICAL — both resolved paths must stay within their roots.
+   *  2. EXISTENCE — `lstat` (not `access`) so a dangling or escaping symlink is
+   *     observed as itself rather than followed.
+   *  3. REAL PATH — the lexical check cannot see through symlinks, so the source's
+   *     real on-disk path is resolved and re-asserted to be inside the repo. A
+   *     symlink (file OR directory) pointing outside is rejected, never chased.
+   */
+  private async resolveContainedSource(
+    repoRoot: string,
+    worktreeRoot: string,
+    rel: string,
+  ): Promise<string | null> {
     const src = path.resolve(repoRoot, rel);
     const dest = path.resolve(worktreeRoot, rel);
     if (!isWithin(repoRoot, src) || !isWithin(worktreeRoot, dest)) {
       console.warn(
         `[git-service] skipping copyFiles pattern escaping its root: ${rel}`,
       );
-      return;
+      return null;
     }
 
     let lst;
     try {
       lst = await fs.lstat(src);
     } catch {
-      return; // not present in the source repo → nothing to copy
+      return null; // not present in the source repo → nothing to copy
     }
 
     let realSrc: string;
@@ -277,24 +300,19 @@ export class GitServiceImpl implements GitServiceContract {
         console.warn(
           `[git-service] skipping copyFiles symlink with unresolvable target: ${rel}`,
         );
-        return;
       }
-      // A non-symlink that vanished between lstat and realpath — skip.
-      return;
+      // A symlink with an unresolvable target (warned above) or a non-symlink
+      // that vanished between lstat and realpath — skip either way.
+      return null;
     }
     if (!isWithin(repoRoot, realSrc)) {
       console.warn(
         `[git-service] skipping copyFiles entry whose real path escapes the repo: ${rel}`,
       );
-      return;
+      return null;
     }
 
-    await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.cp(src, dest, {
-      recursive: true,
-      dereference: false,
-      verbatimSymlinks: true,
-    });
+    return src;
   }
 
   /**

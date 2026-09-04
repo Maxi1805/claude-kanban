@@ -75,6 +75,35 @@ function isCavemanLevel(value: unknown): value is CavemanLevel {
 }
 
 /**
+ * Validate the optional caveman pair (`cavemanEnabled` / `cavemanLevel`) that
+ * both the create and update bodies carry. Only the fields actually present are
+ * returned; the caller decides what absence means (a DTO default on create, an
+ * untouched field on an update patch). The type checks, the level whitelist and
+ * their error messages live here once so both routes reject a bad caveman body
+ * identically.
+ */
+function parseCavemanFields(
+  b: Record<string, unknown>,
+): { cavemanEnabled?: boolean; cavemanLevel?: CavemanLevel } | { error: string } {
+  const out: { cavemanEnabled?: boolean; cavemanLevel?: CavemanLevel } = {};
+  if (b.cavemanEnabled !== undefined) {
+    if (typeof b.cavemanEnabled !== "boolean") {
+      return { error: "`cavemanEnabled` must be a boolean" };
+    }
+    out.cavemanEnabled = b.cavemanEnabled;
+  }
+  if (b.cavemanLevel !== undefined) {
+    if (!isCavemanLevel(b.cavemanLevel)) {
+      return {
+        error: `\`cavemanLevel\` must be one of: ${CAVEMAN_LEVELS.join(", ")}`,
+      };
+    }
+    out.cavemanLevel = b.cavemanLevel;
+  }
+  return out;
+}
+
+/**
  * Whether a patch actually changed what the live session should be told. A level
  * change while caveman is OFF changes nothing the session can act on, so it is
  * persisted silently — editing an unchecked selector must never type into a
@@ -125,14 +154,8 @@ function parseCreateTaskDTO(body: unknown): CreateTaskDTO | { error: string } {
       return { error: "`projectRepoIds` must be an array of strings" };
     }
   }
-  if (b.cavemanEnabled !== undefined && typeof b.cavemanEnabled !== "boolean") {
-    return { error: "`cavemanEnabled` must be a boolean" };
-  }
-  if (b.cavemanLevel !== undefined && !isCavemanLevel(b.cavemanLevel)) {
-    return {
-      error: `\`cavemanLevel\` must be one of: ${CAVEMAN_LEVELS.join(", ")}`,
-    };
-  }
+  const caveman = parseCavemanFields(b);
+  if ("error" in caveman) return caveman;
 
   return {
     projectId: b.projectId,
@@ -140,8 +163,8 @@ function parseCreateTaskDTO(body: unknown): CreateTaskDTO | { error: string } {
     description: (b.description as string | null | undefined) ?? null,
     slug: b.slug as string | undefined,
     projectRepoIds: b.projectRepoIds as string[] | undefined,
-    cavemanEnabled: b.cavemanEnabled as boolean | undefined,
-    cavemanLevel: b.cavemanLevel as CavemanLevel | undefined,
+    cavemanEnabled: caveman.cavemanEnabled,
+    cavemanLevel: caveman.cavemanLevel,
   };
 }
 
@@ -177,19 +200,13 @@ function parseUpdateTaskDTO(body: unknown): UpdateTaskDTO | { error: string } {
     }
     patch.status = b.status;
   }
-  if (b.cavemanEnabled !== undefined) {
-    if (typeof b.cavemanEnabled !== "boolean") {
-      return { error: "`cavemanEnabled` must be a boolean" };
-    }
-    patch.cavemanEnabled = b.cavemanEnabled;
+  const caveman = parseCavemanFields(b);
+  if ("error" in caveman) return caveman;
+  if (caveman.cavemanEnabled !== undefined) {
+    patch.cavemanEnabled = caveman.cavemanEnabled;
   }
-  if (b.cavemanLevel !== undefined) {
-    if (!isCavemanLevel(b.cavemanLevel)) {
-      return {
-        error: `\`cavemanLevel\` must be one of: ${CAVEMAN_LEVELS.join(", ")}`,
-      };
-    }
-    patch.cavemanLevel = b.cavemanLevel;
+  if (caveman.cavemanLevel !== undefined) {
+    patch.cavemanLevel = caveman.cavemanLevel;
   }
 
   return patch;
@@ -316,6 +333,37 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
     res.json(task);
   });
 
+  registerTaskAgentRoutes(router, deps);
+
+  /* DELETE /api/tasks/:id — delegates to TaskLifecycle.deleteTask (teardown). */
+  router.delete("/:id", async (req: Request, res: Response, next: NextFunction) => {
+    const { id } = req.params;
+    const task = repos.tasks.getById(id);
+    if (!task) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+    try {
+      await lifecycle.deleteTask(id);
+      emit({ kind: "task:deleted", taskId: id, projectId: task.projectId });
+      res.status(204).end();
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  return router;
+}
+
+/**
+ * Register the routes of the task-AGENT sub-resource
+ * (`/api/tasks/:id/agent/...`). Its own resource — operations on a task's LIVE
+ * pty rather than on the task row — so it lives in its own function, mirroring
+ * how the projects router splits its repos sub-resource out.
+ */
+function registerTaskAgentRoutes(router: Router, deps: TasksRouterDeps): void {
+  const { repos } = deps;
+
   /* POST /api/tasks/:id/agent/restart — restart the task's agent in place.
    *
    * Kills the pty. The terminal's socket is closed by the bridge on exit and the
@@ -336,23 +384,4 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
     if (wasLive) deps.pty?.kill(task.id);
     res.json({ task, restarted: wasLive });
   });
-
-  /* DELETE /api/tasks/:id — delegates to TaskLifecycle.deleteTask (teardown). */
-  router.delete("/:id", async (req: Request, res: Response, next: NextFunction) => {
-    const { id } = req.params;
-    const task = repos.tasks.getById(id);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-    try {
-      await lifecycle.deleteTask(id);
-      emit({ kind: "task:deleted", taskId: id, projectId: task.projectId });
-      res.status(204).end();
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  return router;
 }

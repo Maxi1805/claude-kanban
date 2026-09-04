@@ -260,29 +260,9 @@ export class TaskLifecycleImpl implements ITaskLifecycle {
       copyFiles: project.copyFiles ?? [],
     });
 
-    // Assemble the session root (idempotent dir + two independent symlinks:
-    // an explicit CLAUDE.md FILE and a .claude DIRECTORY). Precedence per
-    // source, so existing projects (legacy folder) and the global fallback
-    // keep working:
-    //   md  = project.claudeMdPath
-    //         ?? <legacy folder>/CLAUDE.md
-    //         ?? <global template>/CLAUDE.md
-    //   dir = project.claudeDirPath
-    //         ?? <legacy folder>/.claude
-    //         ?? <global template>/.claude
-    //   mcp = project.mcpConfigPath
-    //         ?? <legacy folder>/.mcp.json
-    //         ?? <global template>/.mcp.json
-    const { claudeMdPath, claudeDirPath, mcpConfigPath } = resolveClaudeSources(
-      project,
-      config.templateRepoPath,
-    );
-    await this.git.assembleSessionRoot({
-      sessionRoot: wt.sessionRoot,
-      claudeMdPath,
-      claudeDirPath,
-      mcpConfigPath,
-    });
+    // Assemble the session root (idempotent dir + independent CLAUDE.md /
+    // .claude / .mcp.json symlinks, resolved with per-source precedence).
+    await this.assembleSessionRootFor(project, wt.sessionRoot);
 
     // Record the resolved session root on the task.
     this.repos.tasks.update(taskId, { sessionRoot: wt.sessionRoot });
@@ -300,6 +280,30 @@ export class TaskLifecycleImpl implements ITaskLifecycle {
     );
 
     return { sessionRoot: wt.sessionRoot, taskRepos };
+  }
+
+  /**
+   * Resolve a task's three per-task Claude sources with their precedence — see
+   * {@link resolveClaudeSources} for the full precedence table (the new
+   * per-source fields win; otherwise the legacy folder, then the global
+   * template) — and hand them to git to build the session root: an idempotent
+   * dir plus independent CLAUDE.md FILE / .claude DIRECTORY / .mcp.json symlinks.
+   * Side-effecting; a throw is caught by createTask's rollback.
+   */
+  private async assembleSessionRootFor(
+    project: Project,
+    sessionRoot: string,
+  ): Promise<void> {
+    const { claudeMdPath, claudeDirPath, mcpConfigPath } = resolveClaudeSources(
+      project,
+      config.templateRepoPath,
+    );
+    await this.git.assembleSessionRoot({
+      sessionRoot,
+      claudeMdPath,
+      claudeDirPath,
+      mcpConfigPath,
+    });
   }
 
   /**
