@@ -10,7 +10,8 @@
 import { computed, ref, watch } from "vue";
 import { useBoardStore } from "@/store";
 import RepoPicker from "@/board/RepoPicker.vue";
-import type { Project, AddRepoDTO } from "@/types";
+import { CAVEMAN_DEFAULT_LEVEL, CAVEMAN_LEVELS } from "@/types";
+import type { Project, AddRepoDTO, CavemanLevel } from "@/types";
 
 const props = defineProps<{
   /** Preselect this project when opening. */
@@ -28,6 +29,9 @@ const projectId = ref<string>(props.defaultProjectId ?? board.projects[0]?.id ??
 const title = ref("");
 const description = ref("");
 const selectedRepoIds = ref<string[]>([]);
+/** Caveman for the session about to be created — off unless asked for. */
+const cavemanEnabled = ref(false);
+const cavemanLevel = ref<CavemanLevel>(CAVEMAN_DEFAULT_LEVEL);
 const submitting = ref(false);
 const error = ref<string | null>(null);
 /** Whether the inline RepoPicker panel is shown. */
@@ -109,6 +113,11 @@ async function submit(): Promise<void> {
       description: description.value.trim() || null,
       // Omit projectRepoIds to mean "all repos"; otherwise send the subset.
       projectRepoIds: allSelected ? undefined : [...selectedRepoIds.value],
+      // Decided BEFORE the session exists, so a task created with caveman on has
+      // the plugin loaded from its first message — the only point at which the
+      // saving applies to the whole conversation.
+      cavemanEnabled: cavemanEnabled.value,
+      cavemanLevel: cavemanLevel.value,
     });
     emit("created", task.id);
     emit("close");
@@ -164,6 +173,25 @@ async function submit(): Promise<void> {
             placeholder="Contexto o instrucciones para la sesión de Claude…"
           />
         </label>
+
+        <div class="field">
+          <span class="field__label">Modo caveman <em>(ahorro de tokens)</em></span>
+          <div class="caveman-field">
+            <label class="caveman-field__check">
+              <input v-model="cavemanEnabled" type="checkbox" />
+              <span>Comprimir las respuestas del agente</span>
+            </label>
+            <select
+              v-model="cavemanLevel"
+              class="field__control caveman-field__level"
+              aria-label="Nivel de compresión"
+            >
+              <option v-for="value in CAVEMAN_LEVELS" :key="value" :value="value">
+                {{ value }}
+              </option>
+            </select>
+          </div>
+        </div>
 
         <div class="field">
           <div class="field__label-row">
@@ -311,6 +339,33 @@ async function submit(): Promise<void> {
 }
 textarea.field__control {
   resize: vertical;
+}
+
+/* Caveman row: checkbox takes the width it needs, the level select stays narrow
+   beside it (a full-width select would read as the primary control). */
+.caveman-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.caveman-field__check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  cursor: pointer;
+  color: var(--ck-text-muted);
+}
+.caveman-field__check input {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--ck-primary);
+}
+.caveman-field__level {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  cursor: pointer;
 }
 
 .repo-list {

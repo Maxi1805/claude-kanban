@@ -140,40 +140,12 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
     send(out);
   };
 
-  // ── Replay-before-live ordering, deduped by byte position ────────────────────
-  // We must send the FULL captured history before any live frame, or the
-  // reconnecting terminal renders out of order. Reading the replay is async, so
-  // we register the live onData listener up front but BUFFER its chunks until
-  // the replay has been sent, then flush the buffer in arrival order.
-  //
-  // The replay tail and the live stream can OVERLAP: a chunk captured to disk
-  // after we snapshot the byte cursor but before the tail read can otherwise
-  // land in BOTH the replay and the live buffer, rendering twice on reconnect.
-  // To make them mutually exclusive we track each live chunk's byte POSITION in
-  // the session (anchored at the cursor read when we attached) and, once the
-  // replay's `offset` is known, forward only chunks whose bytes fall AFTER that
-  // cut. Boundaries always align (capture appends whole chunks), so a chunk is
-  // either entirely replayed or entirely live — never split.
-  let replayDone = false;
-  let replayOffset = 0;
-  // Byte position (in the session's captured stream) where this attach began
-  // observing live output. Each live chunk advances `livePos` from here.
-  const baseline = ptyService.bytePosition(taskId);
-  let livePos = baseline;
-  // Buffered live chunks paired with their END byte position, so we can drop any
-  // that the replay already covered once we know the cut.
-  const liveBuffer: Array<{ data: string; end: number }> = [];
+  // Replay-before-live ordering, deduped by byte position. See {@link ReplayGate}.
+  const gate = new ReplayGate(ptyService.bytePosition(taskId));
 
   const offData = ptyService.onData(taskId, (data) => {
-    const start = livePos;
-    livePos += Buffer.byteLength(data, "utf8");
-    const end = livePos;
-    if (!replayDone) {
-      liveBuffer.push({ data, end });
-      return;
-    }
-    // Replay already sent: forward only what the replay did not cover.
-    if (start >= replayOffset) sendOutput(data);
+    const live = gate.observe(data);
+    if (live !== null) sendOutput(live);
   });
 
   // pty exit → notify the client, then close the socket. Buffer an exit that
@@ -187,7 +159,7 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
   };
   const offExit = ptyService.onExit(taskId, (exitCode, signal) => {
     const exit: PtyExitMsg = { type: "pty:exit", taskId, exitCode, signal };
-    if (!replayDone) {
+    if (!gate.isOpen) {
       bufferedExit = exit;
       return;
     }
@@ -202,24 +174,18 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
 
   void Promise.resolve(ptyService.getReplay(taskId))
     .then((replay) => {
-      replayOffset = replay.offset;
+      gate.cutAt(replay.offset);
       if (replay.data.length > 0) sendOutput(replay.data);
     })
     .catch(() => {
       // Replay is best-effort; fall through to live streaming regardless. With
-      // no usable offset, treat the cut as the attach baseline so buffered live
+      // no usable offset, the gate keeps its baseline cut so buffered live
       // chunks are still forwarded (nothing dropped).
-      replayOffset = baseline;
     })
     .finally(() => {
       // Flush anything that arrived live during the async replay read, in order,
-      // skipping any chunk the replay already covered (end <= cut) so no chunk is
-      // both replayed and re-sent.
-      replayDone = true;
-      for (const chunk of liveBuffer) {
-        if (chunk.end > replayOffset) sendOutput(chunk.data);
-      }
-      liveBuffer.length = 0;
+      // skipping any chunk the replay already covered.
+      for (const chunk of gate.open()) sendOutput(chunk);
       // If the task had already exited (no live record will fire), surface the
       // stored exit now so the terminal shows the finished session. A live exit
       // buffered during replay takes precedence.
@@ -236,30 +202,7 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
     });
 
   ws.on("message", (raw) => {
-    let msg: PtyMessage;
-    try {
-      msg = JSON.parse(raw.toString()) as PtyMessage;
-    } catch {
-      return; // ignore malformed frames
-    }
-    switch (msg.type) {
-      case "pty:input":
-        if (typeof msg.data === "string") ptyService.write(taskId, msg.data);
-        break;
-      case "pty:resize":
-        if (
-          Number.isFinite(msg.cols) &&
-          Number.isFinite(msg.rows) &&
-          msg.cols > 0 &&
-          msg.rows > 0
-        ) {
-          ptyService.resize(taskId, msg.cols, msg.rows);
-        }
-        break;
-      default:
-        // pty:output / pty:exit are server-originated; ignore if echoed back.
-        break;
-    }
+    applyInboundFrame(raw.toString(), taskId, ptyService);
   });
 
   // Socket closed: detach listeners only. Deliberately do NOT kill the pty so
@@ -270,6 +213,116 @@ function wire(ws: WebSocket, taskId: string, ptyService: PtyService): void {
   };
   ws.on("close", detach);
   ws.on("error", detach);
+}
+
+/**
+ * Keeps the replayed history and the live stream MUTUALLY EXCLUSIVE for one
+ * attach, and ordered.
+ *
+ * We must send the FULL captured history before any live frame, or the
+ * reconnecting terminal renders out of order. Reading the replay is async, so
+ * the caller registers the live listener up front and hands every chunk here:
+ * while the gate is closed the chunk is BUFFERED, and {@link open} flushes the
+ * buffer in arrival order once the replay has been sent.
+ *
+ * The replay tail and the live stream can OVERLAP: a chunk captured to disk
+ * after we snapshot the byte cursor but before the tail read can otherwise land
+ * in BOTH the replay and the live buffer, rendering twice on reconnect. So the
+ * gate tracks each live chunk's byte POSITION in the session (anchored at the
+ * cursor read when we attached) and forwards only chunks whose bytes fall AFTER
+ * the replay's cut. Boundaries always align (capture appends whole chunks), so
+ * a chunk is either entirely replayed or entirely live — never split.
+ *
+ * The cut starts at the attach baseline, so a FAILED replay read (no usable
+ * offset) still forwards every buffered chunk rather than dropping it.
+ */
+class ReplayGate {
+  /** True once the replay has been sent and live chunks may flow through. */
+  private open_ = false;
+  /** Byte offset the replay covered up to; chunks starting before it are dropped. */
+  private cut: number;
+  /** Byte position of the next live chunk, advanced from the attach baseline. */
+  private pos: number;
+  /** Live chunks held while closed, each with its END byte position. */
+  private readonly buffered: Array<{ data: string; end: number }> = [];
+
+  constructor(baseline: number) {
+    this.cut = baseline;
+    this.pos = baseline;
+  }
+
+  get isOpen(): boolean {
+    return this.open_;
+  }
+
+  /**
+   * Account for one live chunk. Returns the data to forward NOW, or null when
+   * it was buffered (gate still closed) or already covered by the replay.
+   */
+  observe(data: string): string | null {
+    const start = this.pos;
+    this.pos += Buffer.byteLength(data, "utf8");
+    if (!this.open_) {
+      this.buffered.push({ data, end: this.pos });
+      return null;
+    }
+    return start >= this.cut ? data : null;
+  }
+
+  /** Record where the sent replay ended. */
+  cutAt(offset: number): void {
+    this.cut = offset;
+  }
+
+  /**
+   * Open the gate and return the buffered chunks to send, in arrival order,
+   * minus any the replay already covered (end <= cut).
+   */
+  open(): string[] {
+    this.open_ = true;
+    const flush = this.buffered
+      .filter((chunk) => chunk.end > this.cut)
+      .map((chunk) => chunk.data);
+    this.buffered.length = 0;
+    return flush;
+  }
+}
+
+/**
+ * Apply one client → server frame to the task's pty: keystrokes (`pty:input`)
+ * and terminal geometry (`pty:resize`). Malformed JSON, a non-string payload
+ * and a non-finite/non-positive geometry are all ignored rather than thrown —
+ * a bad frame must never tear down a live terminal. `pty:output` / `pty:exit`
+ * are server-originated and ignored if echoed back.
+ */
+function applyInboundFrame(
+  raw: string,
+  taskId: string,
+  ptyService: PtyService,
+): void {
+  let msg: PtyMessage;
+  try {
+    msg = JSON.parse(raw) as PtyMessage;
+  } catch {
+    return; // ignore malformed frames
+  }
+  switch (msg.type) {
+    case "pty:input":
+      if (typeof msg.data === "string") ptyService.write(taskId, msg.data);
+      break;
+    case "pty:resize":
+      if (
+        Number.isFinite(msg.cols) &&
+        Number.isFinite(msg.rows) &&
+        msg.cols > 0 &&
+        msg.rows > 0
+      ) {
+        ptyService.resize(taskId, msg.cols, msg.rows);
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 /** Parse the request URL into a pathname + searchParams (host is irrelevant). */

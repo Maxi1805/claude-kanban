@@ -31,6 +31,7 @@ import type {
   SweepResult,
 } from "../../shared/interfaces.js";
 import { config } from "../config.js";
+import { removeTaskSettingsFile } from "./agent-hooks.js";
 
 const execAsync = promisify(exec);
 
@@ -139,52 +140,9 @@ export class CleanupServiceImpl implements ICleanupService {
       `teardown(${taskId}): "${task.title}" with ${taskRepos.length} repo(s)`,
     );
 
-    // 2. PROCESSES FIRST — kill the pty and its whole process GROUP. This
-    //    cascades to dev servers / file watchers the agent spawned. We then
-    //    wait until the recorded pid is actually dead so nothing is still
-    //    holding a worktree open or a port bound when we get to removal.
-    await this.step(warnings, "kill pty", async () => {
-      this.pty.kill(taskId);
-      await this.waitForPidDeath(task.ptyPid);
-    });
-
-    // 2b. Forget the pty's in-memory state BEFORE deleting its log. `forget`
-    //     flushes any still-pending capture appends and purges the per-task maps
-    //     (exited/writeChains/trimming/logBytes) so (a) those maps don't leak
-    //     over the server's lifetime and (b) no late in-flight append can
-    //     re-create the log AFTER we delete it on the next step.
-    await this.step(warnings, "forget pty state", async () => {
-      await this.pty.forget(taskId);
-    });
-
-    // 2c. Delete this task's pty capture log now that the pty is dead and its
-    //     pending writes are flushed — it can no longer be appended to, and the
-    //     conversation it held is moot once the task is gone. Best-effort:
-    //     tolerate the log never having existed.
-    await this.step(warnings, "delete pty log", async () => {
-      await this.deletePtyLog(taskId);
-    });
-
-    // 2d. Kill every per-repo command SHELL for this task BEFORE touching
-    //     worktrees, so a running dev server (and its children / bound port)
-    //     started inside the shell is gone before its tree is removed — otherwise
-    //     the busy-guard would see the holder and skip removal. No-op when no
-    //     runner is wired.
-    if (this.commandRunner) {
-      const runner = this.commandRunner;
-      await this.step(warnings, "kill task command shells", () => {
-        runner.killAllForTask(taskId);
-      });
-    }
-
-    // 3. Free any allocated port (best-effort) — the group kill above should
-    //    already have released it; this is a belt-and-braces reclaim.
-    if (task.port != null) {
-      const port = task.port;
-      await this.step(warnings, `free port ${port}`, async () => {
-        await this.freePort(port);
-      });
-    }
+    // 2-3. Everything that is RUNNING or run-scoped: processes first, then the
+    //      files and the port that only exist while the task runs.
+    await this.haltTaskRuntime(task, warnings);
 
     // 4. Delete Claude session transcript dir(s) for this task's session root.
     if (task.sessionRoot) {
@@ -225,6 +183,76 @@ export class CleanupServiceImpl implements ICleanupService {
       );
     } else {
       this.log.info(`teardown(${taskId}): clean`);
+    }
+  }
+
+  /**
+   * Stop everything the task has RUNNING and erase what only exists while it
+   * runs: the pty and its whole process group, the pty's in-memory state, its
+   * capture log, its `--settings` file, every per-repo command shell, and the
+   * allocated port. Runs before any worktree is touched, so nothing is still
+   * holding a tree open or a port bound when removal starts.
+   *
+   * THE ORDER INSIDE IS LOAD-BEARING and must not be rearranged — each step's
+   * comment says what it depends on. Every step is best-effort: failures are
+   * collected into `warnings`, never thrown.
+   */
+  private async haltTaskRuntime(task: Task, warnings: string[]): Promise<void> {
+    const taskId = task.id;
+
+    // 2. PROCESSES FIRST — kill the pty and its whole process GROUP. This
+    //    cascades to dev servers / file watchers the agent spawned. We then
+    //    wait until the recorded pid is actually dead so nothing is still
+    //    holding a worktree open or a port bound when we get to removal.
+    await this.step(warnings, "kill pty", async () => {
+      this.pty.kill(taskId);
+      await this.waitForPidDeath(task.ptyPid);
+    });
+
+    // 2b. Forget the pty's in-memory state BEFORE deleting its log. `forget`
+    //     flushes any still-pending capture appends and purges the per-task maps
+    //     (exited/writeChains/trimming/logBytes) so (a) those maps don't leak
+    //     over the server's lifetime and (b) no late in-flight append can
+    //     re-create the log AFTER we delete it on the next step.
+    await this.step(warnings, "forget pty state", async () => {
+      await this.pty.forget(taskId);
+    });
+
+    // 2c. Delete this task's pty capture log now that the pty is dead and its
+    //     pending writes are flushed — it can no longer be appended to, and the
+    //     conversation it held is moot once the task is gone. Best-effort:
+    //     tolerate the log never having existed.
+    await this.step(warnings, "delete pty log", async () => {
+      await this.deletePtyLog(taskId);
+    });
+
+    // 2c-bis. Drop the task's `--settings` file (hooks + its caveman plugin
+    //     switch), written fresh on every spawn. Nothing will spawn for this task
+    //     again, so leaving it would just accumulate one dead file per deleted
+    //     task. Best-effort, like the log.
+    await this.step(warnings, "delete task settings file", async () => {
+      await removeTaskSettingsFile(taskId);
+    });
+
+    // 2d. Kill every per-repo command SHELL for this task BEFORE touching
+    //     worktrees, so a running dev server (and its children / bound port)
+    //     started inside the shell is gone before its tree is removed — otherwise
+    //     the busy-guard would see the holder and skip removal. No-op when no
+    //     runner is wired.
+    if (this.commandRunner) {
+      const runner = this.commandRunner;
+      await this.step(warnings, "kill task command shells", () => {
+        runner.killAllForTask(taskId);
+      });
+    }
+
+    // 3. Free any allocated port (best-effort) — the group kill above should
+    //    already have released it; this is a belt-and-braces reclaim.
+    if (task.port != null) {
+      const port = task.port;
+      await this.step(warnings, `free port ${port}`, async () => {
+        await this.freePort(port);
+      });
     }
   }
 
@@ -295,34 +323,44 @@ export class CleanupServiceImpl implements ICleanupService {
     );
 
     if (repoPath) {
-      // Delete the local task branch.
-      await this.step(
-        warnings,
-        `delete local branch ${repo.branchName}`,
-        () => this.git.deleteLocalBranch(repoPath, repo.branchName),
-      );
-
-      // Delete the remote branch (best-effort: only meaningful if pushed).
-      await this.step(
-        warnings,
-        `delete remote branch ${repo.branchName}`,
-        () => this.git.deleteRemoteBranch(repoPath, repo.branchName),
-      );
-
-      // Prune stale worktree admin entries.
-      await this.step(warnings, `prune ${repoPath}`, () =>
-        this.git.pruneWorktrees(repoPath),
-      );
-
-      // Fetch with prune to drop any stale remote-tracking refs (best-effort).
-      await this.step(warnings, `git fetch --prune ${repoPath}`, async () => {
-        await execAsync("git fetch --prune", { cwd: repoPath });
-      });
+      await this.dropBranchesAndRefreshRepo(repoPath, repo, warnings);
     } else {
       warnings.push(
         `could not resolve source repo path for ${repo.repoName} (${repo.projectRepoId}); skipped branch/prune`,
       );
     }
+  }
+
+  /**
+   * After a task's worktree is gone, drop the branch it lived on (local, then
+   * remote) and bring the SOURCE repo's view of the world back in line: prune
+   * the stale worktree admin entry, then fetch --prune to drop stale
+   * remote-tracking refs. Every step is best-effort and only ever adds warnings.
+   */
+  private async dropBranchesAndRefreshRepo(
+    repoPath: string,
+    repo: TaskRepo,
+    warnings: string[],
+  ): Promise<void> {
+    // Delete the local task branch.
+    await this.step(warnings, `delete local branch ${repo.branchName}`, () =>
+      this.git.deleteLocalBranch(repoPath, repo.branchName),
+    );
+
+    // Delete the remote branch (best-effort: only meaningful if pushed).
+    await this.step(warnings, `delete remote branch ${repo.branchName}`, () =>
+      this.git.deleteRemoteBranch(repoPath, repo.branchName),
+    );
+
+    // Prune stale worktree admin entries.
+    await this.step(warnings, `prune ${repoPath}`, () =>
+      this.git.pruneWorktrees(repoPath),
+    );
+
+    // Fetch with prune to drop any stale remote-tracking refs (best-effort).
+    await this.step(warnings, `git fetch --prune ${repoPath}`, async () => {
+      await execAsync("git fetch --prune", { cwd: repoPath });
+    });
   }
 
   /* ──────────────────────────────────────────────────────────────────────
@@ -341,22 +379,10 @@ export class CleanupServiceImpl implements ICleanupService {
 
     // Prune every known source repo up front so git's view is fresh and stale
     // admin entries (from prior crashes) are cleared before we scan.
-    const knownRepoPaths = this.collectKnownRepoPaths(allTaskRepos);
-    for (const repoPath of knownRepoPaths) {
-      try {
-        await this.git.pruneWorktrees(repoPath);
-      } catch (err) {
-        result.errors.push(`prune ${repoPath}: ${errMsg(err)}`);
-      }
-    }
+    await this.pruneKnownRepos(allTaskRepos, result);
 
     // Set of live session roots (abs paths) keyed by DB tasks.
-    const liveSessionRoots = new Set<string>();
-    for (const task of tasks) {
-      if (task.sessionRoot) {
-        liveSessionRoots.add(path.resolve(task.sessionRoot));
-      }
-    }
+    const liveSessionRoots = collectLiveSessionRoots(tasks);
 
     // A. Filesystem → DB: any session dir on disk NOT matching a live task is
     //    an orphan; remove it (subject to the busy-guard).
@@ -387,6 +413,25 @@ export class CleanupServiceImpl implements ICleanupService {
     }
 
     return result;
+  }
+
+  /**
+   * `git worktree prune` every source repo the DB knows about, so git's view is
+   * fresh and stale admin entries (left by prior crashes) are gone before the
+   * sweep scans. A repo that cannot be pruned is recorded and skipped — one bad
+   * repo must never abort the sweep.
+   */
+  private async pruneKnownRepos(
+    allTaskRepos: TaskRepo[],
+    result: SweepResult,
+  ): Promise<void> {
+    for (const repoPath of this.collectKnownRepoPaths(allTaskRepos)) {
+      try {
+        await this.git.pruneWorktrees(repoPath);
+      } catch (err) {
+        result.errors.push(`prune ${repoPath}: ${errMsg(err)}`);
+      }
+    }
   }
 
   /**
@@ -901,6 +946,21 @@ export class CleanupServiceImpl implements ICleanupService {
 /* ──────────────────────────────────────────────────────────────────────────
  * Free helpers
  * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The absolute session roots that DB tasks still claim. Anything on disk that is
+ * NOT in this set is an orphan as far as the sweep is concerned, so the paths are
+ * resolved before comparison.
+ */
+function collectLiveSessionRoots(tasks: Task[]): Set<string> {
+  const roots = new Set<string>();
+  for (const task of tasks) {
+    if (task.sessionRoot) {
+      roots.add(path.resolve(task.sessionRoot));
+    }
+  }
+  return roots;
+}
 
 /** Depth of a path (number of separated segments). */
 function pathDepth(p: string): number {

@@ -170,6 +170,64 @@ function parseCopyFiles(
   return { value: out };
 }
 
+/**
+ * The optional Claude-config source fields a project carries. Both POST
+ * /api/projects and PATCH /api/projects/:id accept exactly this set, validated
+ * exactly the same way — {@link parseClaudeSourceFields} is the single place
+ * that knows how.
+ */
+interface ClaudeSourceFields {
+  claudeConfigPath: string | null;
+  claudeMdPath: string | null;
+  claudeDirPath: string | null;
+  mcpConfigPath: string | null;
+  copyFiles: string[];
+}
+
+/**
+ * The order fields are validated in, which is the order their errors surface in
+ * — a body with two bad fields reports the first one in THIS list, so the array
+ * is part of the API contract, not an implementation detail.
+ */
+const CLAUDE_SOURCE_FIELDS = [
+  "claudeConfigPath",
+  "claudeMdPath",
+  "claudeDirPath",
+  "mcpConfigPath",
+  "copyFiles",
+] as const;
+
+const CLAUDE_SOURCE_PARSERS = {
+  claudeConfigPath: parseClaudeConfigPath,
+  claudeMdPath: (v: unknown) => parseClaudeSourcePath("claudeMdPath", "file", v),
+  claudeDirPath: (v: unknown) => parseClaudeSourcePath("claudeDirPath", "dir", v),
+  mcpConfigPath: (v: unknown) => parseClaudeSourcePath("mcpConfigPath", "file", v),
+  copyFiles: parseCopyFiles,
+};
+
+/**
+ * Validate every Claude-source field PRESENT in the body, in
+ * {@link CLAUDE_SOURCE_FIELDS} order; the first failure wins.
+ *
+ * Absent fields are simply left out of the result — which is what PATCH wants
+ * (don't touch what wasn't sent). POST fills its own defaults in for the
+ * missing ones; that is identical to parsing `undefined`, since every parser
+ * here maps `undefined` to the same default.
+ */
+function parseClaudeSourceFields(
+  b: Record<string, unknown>,
+): { value: Partial<ClaudeSourceFields> } | { error: string } {
+  const out: Partial<ClaudeSourceFields> = {};
+  for (const field of CLAUDE_SOURCE_FIELDS) {
+    if (b[field] === undefined) continue;
+    const parsed = CLAUDE_SOURCE_PARSERS[field](b[field]);
+    if ("error" in parsed) return { error: parsed.error };
+    /* Safe: the parser table maps each field to a parser of its own type. */
+    (out as Record<string, unknown>)[field] = parsed.value;
+  }
+  return { value: out };
+}
+
 /** Validate + normalize an AddRepoDTO from an untyped request body. */
 function parseAddRepoDTO(body: unknown): AddRepoDTO | { error: string } {
   if (typeof body !== "object" || body === null) {
@@ -224,6 +282,81 @@ function parseUpdateRepoDTO(body: unknown): UpdateRepoDTO | { error: string } {
   return patch;
 }
 
+/**
+ * Validate a CreateProjectDTO from an untyped request body. Pure: it reads the
+ * filesystem to check the Claude paths, but touches no repository and writes
+ * nothing — the route turns the first `{ error }` into a 400 and only then
+ * persists.
+ */
+function parseCreateProjectDTO(
+  body: unknown,
+): CreateProjectDTO | { error: string } {
+  if (typeof body !== "object" || body === null) {
+    return { error: "Request body must be an object" };
+  }
+  const b = body as Record<string, unknown>;
+  if (!isNonEmptyString(b.name)) {
+    return { error: "`name` is required and must be a non-empty string" };
+  }
+  if (!Array.isArray(b.repos)) {
+    return { error: "`repos` is required and must be an array" };
+  }
+
+  const parsedRepos: AddRepoDTO[] = [];
+  for (const [i, raw] of b.repos.entries()) {
+    const parsed = parseAddRepoDTO(raw);
+    if ("error" in parsed) return { error: `repos[${i}]: ${parsed.error}` };
+    parsedRepos.push(parsed);
+  }
+
+  const claude = parseClaudeSourceFields(b);
+  if ("error" in claude) return { error: claude.error };
+
+  return {
+    name: b.name,
+    repos: parsedRepos,
+    claudeConfigPath: claude.value.claudeConfigPath ?? null,
+    claudeMdPath: claude.value.claudeMdPath ?? null,
+    claudeDirPath: claude.value.claudeDirPath ?? null,
+    mcpConfigPath: claude.value.mcpConfigPath ?? null,
+    copyFiles: claude.value.copyFiles ?? [],
+  };
+}
+
+/** The project fields PATCH /api/projects/:id may change. */
+interface UpdateProjectPatch {
+  name?: string;
+  claudeConfigPath?: string | null;
+  claudeMdPath?: string | null;
+  claudeDirPath?: string | null;
+  mcpConfigPath?: string | null;
+  copyFiles?: string[];
+}
+
+/**
+ * Validate a project patch from an untyped body. Only the fields actually sent
+ * are carried into the patch; a body that sets none of them yields an empty
+ * patch (a no-op update that still returns the project).
+ */
+function parseUpdateProjectDTO(
+  body: unknown,
+): UpdateProjectPatch | { error: string } {
+  if (typeof body !== "object" || body === null) {
+    return { error: "Request body must be an object" };
+  }
+  const b = body as Record<string, unknown>;
+  const patch: UpdateProjectPatch = {};
+  if (b.name !== undefined) {
+    if (!isNonEmptyString(b.name)) {
+      return { error: "`name` must be a non-empty string" };
+    }
+    patch.name = b.name;
+  }
+  const claude = parseClaudeSourceFields(b);
+  if ("error" in claude) return { error: claude.error };
+  return { ...patch, ...claude.value };
+}
+
 export function createProjectsRouter(deps: ProjectsRouterDeps): Router {
   const { repos } = deps;
   const emit: BoardEventEmitter = deps.emit ?? (() => {});
@@ -238,80 +371,11 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Router {
 
   /* POST /api/projects */
   router.post("/", (req: Request, res: Response) => {
-    const body = req.body as unknown;
-    if (typeof body !== "object" || body === null) {
-      res.status(400).json({ error: "Request body must be an object" });
+    const dto = parseCreateProjectDTO(req.body);
+    if ("error" in dto) {
+      res.status(400).json({ error: dto.error });
       return;
     }
-    const b = body as Record<string, unknown>;
-    if (!isNonEmptyString(b.name)) {
-      res
-        .status(400)
-        .json({ error: "`name` is required and must be a non-empty string" });
-      return;
-    }
-    if (!Array.isArray(b.repos)) {
-      res.status(400).json({ error: "`repos` is required and must be an array" });
-      return;
-    }
-
-    const parsedRepos: AddRepoDTO[] = [];
-    for (const [i, raw] of b.repos.entries()) {
-      const parsed = parseAddRepoDTO(raw);
-      if ("error" in parsed) {
-        res.status(400).json({ error: `repos[${i}]: ${parsed.error}` });
-        return;
-      }
-      parsedRepos.push(parsed);
-    }
-
-    const configPath = parseClaudeConfigPath(b.claudeConfigPath);
-    if ("error" in configPath) {
-      res.status(400).json({ error: configPath.error });
-      return;
-    }
-    const mdPath = parseClaudeSourcePath(
-      "claudeMdPath",
-      "file",
-      b.claudeMdPath,
-    );
-    if ("error" in mdPath) {
-      res.status(400).json({ error: mdPath.error });
-      return;
-    }
-    const dirPath = parseClaudeSourcePath(
-      "claudeDirPath",
-      "dir",
-      b.claudeDirPath,
-    );
-    if ("error" in dirPath) {
-      res.status(400).json({ error: dirPath.error });
-      return;
-    }
-    const mcpPath = parseClaudeSourcePath(
-      "mcpConfigPath",
-      "file",
-      b.mcpConfigPath,
-    );
-    if ("error" in mcpPath) {
-      res.status(400).json({ error: mcpPath.error });
-      return;
-    }
-    const copyFiles = parseCopyFiles(b.copyFiles);
-    if ("error" in copyFiles) {
-      res.status(400).json({ error: copyFiles.error });
-      return;
-    }
-
-    const dto: CreateProjectDTO = {
-      name: b.name,
-      repos: parsedRepos,
-      claudeConfigPath: configPath.value,
-      claudeMdPath: mdPath.value,
-      claudeDirPath: dirPath.value,
-      mcpConfigPath: mcpPath.value,
-      copyFiles: copyFiles.value,
-    };
     const project = repos.projects.create(dto);
     emit({ kind: "project:created", projectId: project.id, project });
     res.status(201).json(project);
@@ -329,80 +393,11 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Router {
 
   /* PATCH /api/projects/:id */
   router.patch("/:id", (req: Request, res: Response) => {
-    const body = req.body as unknown;
-    if (typeof body !== "object" || body === null) {
-      res.status(400).json({ error: "Request body must be an object" });
+    const patch = parseUpdateProjectDTO(req.body);
+    if ("error" in patch) {
+      res.status(400).json({ error: patch.error });
       return;
     }
-    const b = body as Record<string, unknown>;
-    const patch: {
-      name?: string;
-      claudeConfigPath?: string | null;
-      claudeMdPath?: string | null;
-      claudeDirPath?: string | null;
-      mcpConfigPath?: string | null;
-      copyFiles?: string[];
-    } = {};
-    if (b.name !== undefined) {
-      if (!isNonEmptyString(b.name)) {
-        res.status(400).json({ error: "`name` must be a non-empty string" });
-        return;
-      }
-      patch.name = b.name;
-    }
-    if (b.claudeConfigPath !== undefined) {
-      const configPath = parseClaudeConfigPath(b.claudeConfigPath);
-      if ("error" in configPath) {
-        res.status(400).json({ error: configPath.error });
-        return;
-      }
-      patch.claudeConfigPath = configPath.value;
-    }
-    if (b.claudeMdPath !== undefined) {
-      const mdPath = parseClaudeSourcePath(
-        "claudeMdPath",
-        "file",
-        b.claudeMdPath,
-      );
-      if ("error" in mdPath) {
-        res.status(400).json({ error: mdPath.error });
-        return;
-      }
-      patch.claudeMdPath = mdPath.value;
-    }
-    if (b.claudeDirPath !== undefined) {
-      const dirPath = parseClaudeSourcePath(
-        "claudeDirPath",
-        "dir",
-        b.claudeDirPath,
-      );
-      if ("error" in dirPath) {
-        res.status(400).json({ error: dirPath.error });
-        return;
-      }
-      patch.claudeDirPath = dirPath.value;
-    }
-    if (b.mcpConfigPath !== undefined) {
-      const mcpPath = parseClaudeSourcePath(
-        "mcpConfigPath",
-        "file",
-        b.mcpConfigPath,
-      );
-      if ("error" in mcpPath) {
-        res.status(400).json({ error: mcpPath.error });
-        return;
-      }
-      patch.mcpConfigPath = mcpPath.value;
-    }
-    if (b.copyFiles !== undefined) {
-      const copyFiles = parseCopyFiles(b.copyFiles);
-      if ("error" in copyFiles) {
-        res.status(400).json({ error: copyFiles.error });
-        return;
-      }
-      patch.copyFiles = copyFiles.value;
-    }
-
     const updated = repos.projects.update(req.params.id, patch);
     if (!updated) {
       res.status(404).json({ error: "Project not found" });
@@ -442,6 +437,23 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Router {
     },
   );
 
+  registerProjectRepoRoutes(router, repos, emit);
+
+  return router;
+}
+
+/**
+ * Register the routes of the project-REPOS sub-resource
+ * (`/api/projects/:id/repos[/:repoId]`). Its own resource, with its own
+ * "Project repo not found" 404, so it lives in its own function; every route
+ * answers with the re-read hydrated PROJECT, never the bare ProjectRepo, so the
+ * client's store can upsert the project directly.
+ */
+function registerProjectRepoRoutes(
+  router: Router,
+  repos: Repositories,
+  emit: BoardEventEmitter,
+): void {
   /* POST /api/projects/:id/repos */
   router.post("/:id/repos", (req: Request, res: Response) => {
     const project = repos.projects.getById(req.params.id);
@@ -517,6 +529,4 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Router {
     }
     res.status(204).end();
   });
-
-  return router;
 }

@@ -34,7 +34,10 @@ import type {
 } from "../../shared/interfaces.js";
 import type { Task } from "../../shared/types.js";
 import { config } from "../config.js";
-import { agentHooksFilePath } from "./agent-hooks.js";
+import {
+  agentHooksFilePath,
+  ensureTaskSettingsFile,
+} from "./agent-hooks.js";
 
 /** Internal record tracking one live pty and its subscriber sets. */
 interface PtyRecord {
@@ -63,6 +66,31 @@ const DEFAULT_ROWS = 24;
 
 /** Optional hook so lifecycle can persist the spawned pid. */
 export type PtySpawnListener = (taskId: string, pid: number) => void;
+
+/**
+ * The server's environment, stripped of everything a task's agent must NOT
+ * inherit:
+ *
+ *  - CLAUDECODE + CLAUDE_CODE_* (SESSION_ID, CHILD_SESSION, ENTRYPOINT,
+ *    EXECPATH...) — the Claude Code session identity this server may itself have
+ *    been launched with. Left in, they make the spawned `claude` run in
+ *    nested/child mode and NOT persist a normal per-cwd transcript, which
+ *    silently breaks resume (`claude --continue` then finds "no conversation").
+ *    Removing them makes each task a first-class session that resumes correctly.
+ *  - NODE_ENV — the kanban SERVER's `production` value. Inside the task the agent
+ *    runs dev tooling (npm install / dev servers), and production mode makes npm
+ *    OMIT devDependencies, breaking dev builds (nuxt/vite plugins live there).
+ */
+function cleanAgentEnv(): Record<string, string> {
+  const env = { ...process.env } as Record<string, string>;
+  for (const key of Object.keys(env)) {
+    if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_")) {
+      delete env[key];
+    }
+  }
+  delete env.NODE_ENV;
+  return env;
+}
 
 export class PtyServiceImpl implements IPtyService {
   private readonly ptys = new Map<string, PtyRecord>();
@@ -112,6 +140,13 @@ export class PtyServiceImpl implements IPtyService {
   private readonly lastOutputAt = new Map<string, number>();
 
   /**
+   * Per-task epoch ms of the last byte written INTO the pty. Mirrors
+   * {@link lastOutputAt} for the opposite direction: that one says "the agent is
+   * still talking", this one says "the user is still typing".
+   */
+  private readonly lastInputAt = new Map<string, number>();
+
+  /**
    * Register a callback invoked with `(taskId, pid)` whenever a pty is spawned.
    * Lifecycle uses this to persist `tasks.pty_pid`. Returns an unsubscribe fn.
    */
@@ -159,28 +194,15 @@ export class PtyServiceImpl implements IPtyService {
     this.writeChains.set(task.id, this.resetLog(task.id));
 
     const cwd = task.sessionRoot;
-    // Spawn the agent as a CLEAN, independent Claude Code session. Strip the
-    // Claude Code session identity this server may have inherited (e.g. when the
-    // app itself was launched from inside a Claude Code session): CLAUDECODE +
-    // CLAUDE_CODE_* (SESSION_ID, CHILD_SESSION, ENTRYPOINT, EXECPATH...). Left in,
-    // they make the spawned `claude` run in nested/child mode and NOT persist a
-    // normal per-cwd transcript — which silently breaks resume (`claude
-    // --continue` then finds "no conversation"). Removing them makes each task a
-    // first-class session that persists and resumes correctly.
-    const env = { ...process.env } as Record<string, string>;
-    for (const key of Object.keys(env)) {
-      if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_")) {
-        delete env[key];
-      }
-    }
-    // Also drop the kanban SERVER's NODE_ENV=production: inside the task the agent
-    // runs dev tooling (npm install / dev servers), and production mode makes npm
-    // OMIT devDependencies, breaking dev builds (nuxt/vite plugins live there).
-    delete env.NODE_ENV;
+    const env = cleanAgentEnv();
     const cols = DEFAULT_COLS;
     const rows = DEFAULT_ROWS;
 
-    const { command, args } = this.resolveCommand(opts?.resume === true);
+    const settingsFile = await this.settingsFileFor(task);
+    const { command, args } = this.resolveCommand(
+      opts?.resume === true,
+      settingsFile,
+    );
 
     const proc = pty.spawn(command, args, {
       name: "xterm-color",
@@ -214,42 +236,67 @@ export class PtyServiceImpl implements IPtyService {
       });
     }
 
-    proc.onData((data) => {
-      // Bump the per-task activity clock on every output chunk. The clock keeps a
-      // "working" task working while claude streams, and the AgentActivityMonitor
-      // lapses it to "waiting" once output goes quiet. It is NOT used to PROMOTE
-      // (waiting → working) — that is hook-driven (api/agent-events.ts) — so the
-      // redraw burst from merely opening/resizing a terminal can't flip an idle
-      // task to "working". No terminal text is parsed — just the time.
-      this.lastOutputAt.set(task.id, Date.now());
-      // Capture to disk FIRST (fire-and-forget) so reconnecting terminals can
-      // replay it, then fan out to live listeners. Capturing never blocks fan-out.
-      this.capture(task.id, data);
-      for (const cb of record.dataListeners) cb(data);
-    });
-
-    proc.onExit(({ exitCode, signal }) => {
-      const sig = typeof signal === "number" ? signal : null;
-      // Remember the exit so post-exit reconnects replay-then-show-finished.
-      // CRUCIAL: do NOT wipe the on-disk log here — history must survive exit.
-      this.exited.set(task.id, { exitCode, signal: sig });
-      for (const cb of record.exitListeners) cb(exitCode, sig);
-      // Notify global exit subscribers (lifecycle clears the task's agent_state).
-      // Fired AFTER the per-task listeners so the bridge's exit handling is
-      // unaffected; carries the taskId since these listeners are not task-scoped.
-      for (const cb of this.exitAnyListeners) cb(task.id, exitCode, sig);
-      this.ptys.delete(task.id);
-    });
+    this.wireProcessOutput(record);
 
     for (const cb of this.spawnListeners) cb(task.id, record.pid);
 
     return { taskId: task.id, pid: record.pid, cols, rows };
   }
 
+  /**
+   * Subscribe this service to a freshly spawned pty's output and exit: capture
+   * every chunk to disk and fan it out to live terminals, and on exit remember
+   * the status, notify per-task then global listeners, and drop the record.
+   */
+  private wireProcessOutput(record: PtyRecord): void {
+    const taskId = record.taskId;
+
+    record.proc.onData((data) => {
+      // Bump the per-task activity clock on every output chunk. The clock keeps a
+      // "working" task working while claude streams, and the AgentActivityMonitor
+      // lapses it to "waiting" once output goes quiet. It is NOT used to PROMOTE
+      // (waiting → working) — that is hook-driven (api/agent-events.ts) — so the
+      // redraw burst from merely opening/resizing a terminal can't flip an idle
+      // task to "working". No terminal text is parsed — just the time.
+      this.lastOutputAt.set(taskId, Date.now());
+      // Capture to disk FIRST (fire-and-forget) so reconnecting terminals can
+      // replay it, then fan out to live listeners. Capturing never blocks fan-out.
+      this.capture(taskId, data);
+      for (const cb of record.dataListeners) cb(data);
+    });
+
+    record.proc.onExit(({ exitCode, signal }) => {
+      const sig = typeof signal === "number" ? signal : null;
+      // Remember the exit so post-exit reconnects replay-then-show-finished.
+      // CRUCIAL: do NOT wipe the on-disk log here — history must survive exit.
+      this.exited.set(taskId, { exitCode, signal: sig });
+      for (const cb of record.exitListeners) cb(exitCode, sig);
+      // Notify global exit subscribers (lifecycle clears the task's agent_state).
+      // Fired AFTER the per-task listeners so the bridge's exit handling is
+      // unaffected; carries the taskId since these listeners are not task-scoped.
+      for (const cb of this.exitAnyListeners) cb(taskId, exitCode, sig);
+      this.ptys.delete(taskId);
+    });
+  }
+
   write(taskId: string, data: string): void {
     const rec = this.ptys.get(taskId);
     if (!rec) return;
+    // Stamp the INPUT clock before writing. Everything the user types arrives
+    // here (the ws bridge forwards `pty:input` to this method), so this is the
+    // one place that knows a human is mid-keystroke — which is what keeps an
+    // automated injection from landing in the middle of a half-typed prompt and
+    // fusing with it (see caveman.ts#waitForQuiet).
+    this.lastInputAt.set(taskId, Date.now());
     rec.proc.write(data);
+  }
+
+  /**
+   * Epoch ms of the last byte written INTO this task's pty — user keystrokes as
+   * well as anything the server typed. Undefined when nothing was ever written.
+   */
+  getLastInputAt(taskId: string): number | undefined {
+    return this.lastInputAt.get(taskId);
   }
 
   resize(taskId: string, cols: number, rows: number): void {
@@ -573,22 +620,46 @@ export class PtyServiceImpl implements IPtyService {
    * conversation instead of starting fresh. The shell fallback never resumes.
    *
    * For the real `claude` (NOT the shell fallback) we also append
-   * `--settings <hooksFile>` so the kanban detection hooks are MERGED into the
+   * `--settings <file>` so the kanban detection hooks are MERGED into the
    * session — Claude Code concatenates `--settings` hook arrays with the user's
    * own, so this never replaces the user's hooks. The shell fallback gets no
    * `--settings` (bash wouldn't understand it).
+   *
+   * `settingsFile` is the task's own settings file (hooks + its caveman plugin
+   * switch), written just before the spawn. It falls back to the shared hooks
+   * file when that write failed, so a full disk costs the caveman checkbox but
+   * never the agent-state detection.
    */
-  private resolveCommand(resume: boolean): { command: string; args: string[] } {
+  private resolveCommand(
+    resume: boolean,
+    settingsFile: string,
+  ): { command: string; args: string[] } {
     const configured = config.defaultAgentCommand;
     if (this.isOnPath(configured)) {
       const args = [...config.defaultAgentArgs];
       if (resume) args.push(...config.agentResumeArgs);
-      // Inject the kanban hooks settings file so per-task agent-state detection
-      // works. Path only — the file is ensured on boot (server/index.ts).
-      args.push("--settings", agentHooksFilePath());
+      args.push("--settings", settingsFile);
       return { command: configured, args };
     }
     return { command: this.fallbackShell(), args: ["-i"] };
+  }
+
+  /**
+   * The `--settings` file for this spawn: the per-task one, or the shared hooks
+   * file if writing it failed. Never throws — a settings problem must not be
+   * able to stop a task's agent from starting.
+   */
+  private async settingsFileFor(task: Task): Promise<string> {
+    try {
+      return await ensureTaskSettingsFile(task);
+    } catch (err) {
+      console.error(
+        `[pty] failed to write task settings for ${task.id}; ` +
+          `falling back to the shared hooks file:`,
+        err,
+      );
+      return agentHooksFilePath();
+    }
   }
 
   /** The interactive shell used when the agent command is unavailable. */

@@ -9,6 +9,7 @@
 import { nanoid } from "nanoid";
 import type {
   AgentState,
+  CavemanLevel,
   Project,
   ProjectRepo,
   Task,
@@ -68,6 +69,10 @@ interface TaskRow {
   port: number | null;
   agent_state: string | null;
   agent_state_at: string | null;
+  /** SQLite has no boolean: 0/1. Absent (undefined) on a pre-migration row. */
+  caveman_enabled: number | null;
+  caveman_level: string | null;
+  caveman_session: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -163,6 +168,12 @@ function mapTask(row: TaskRow): Task {
     port: row.port,
     agentState: row.agent_state as AgentState | null,
     agentStateAt: row.agent_state_at,
+    cavemanEnabled: row.caveman_enabled === 1,
+    cavemanLevel: (row.caveman_level as CavemanLevel | null) ?? null,
+    cavemanSession:
+      row.caveman_session === null || row.caveman_session === undefined
+        ? null
+        : row.caveman_session === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -184,9 +195,93 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * The `column = ?` assignments of one UPDATE, with their bound values kept in
+ * the SAME order. Every repository builds a partial update the same way — only
+ * the fields the patch actually mentions are assigned — so this holds the two
+ * parallel arrays together instead of each `update` juggling them by hand.
+ *
+ * Empty means the patch changed nothing, which callers treat as a no-op read
+ * rather than an UPDATE with an empty SET list.
+ */
+class UpdateAssignments {
+  private readonly columns: string[] = [];
+  private readonly bound: unknown[] = [];
+
+  /** Assign `column = ?` and bind `value` to it. */
+  set(column: string, value: unknown): void {
+    this.columns.push(`${column} = ?`);
+    this.bound.push(value);
+  }
+
+  get isEmpty(): boolean {
+    return this.columns.length === 0;
+  }
+
+  /** The SET clause body, e.g. `title = ?, status = ?`. */
+  get clause(): string {
+    return this.columns.join(", ");
+  }
+
+  /** The bound values in clause order, followed by the trailing WHERE params. */
+  params(...where: unknown[]): never[] {
+    return [...this.bound, ...where] as never[];
+  }
+}
+
 /* ────────────────────────────────────────────────────────────────────────
  * ProjectRepository
  * ──────────────────────────────────────────────────────────────────────── */
+
+/** The fields a project update may change (mirrors ProjectRepository.update). */
+type ProjectPatch = {
+  name?: string;
+  claudeConfigPath?: string | null;
+  claudeMdPath?: string | null;
+  claudeDirPath?: string | null;
+  mcpConfigPath?: string | null;
+  copyFiles?: string[];
+};
+
+/**
+ * Map a project patch onto its column assignments. Only the fields the patch
+ * MENTIONS are assigned (`undefined` means "leave alone", while an explicit
+ * null clears the column), and each config path goes through the same
+ * normalization as on create so a blank string is stored as NULL.
+ */
+function buildProjectAssignments(patch: ProjectPatch): UpdateAssignments {
+  const assignments = new UpdateAssignments();
+
+  if (patch.name !== undefined) {
+    assignments.set("name", patch.name);
+  }
+  if (patch.claudeConfigPath !== undefined) {
+    assignments.set(
+      "claude_config_path",
+      normalizeConfigPath(patch.claudeConfigPath),
+    );
+  }
+  if (patch.claudeMdPath !== undefined) {
+    assignments.set("claude_md_path", normalizeConfigPath(patch.claudeMdPath));
+  }
+  if (patch.claudeDirPath !== undefined) {
+    assignments.set(
+      "claude_dir_path",
+      normalizeConfigPath(patch.claudeDirPath),
+    );
+  }
+  if (patch.mcpConfigPath !== undefined) {
+    assignments.set(
+      "mcp_config_path",
+      normalizeConfigPath(patch.mcpConfigPath),
+    );
+  }
+  if (patch.copyFiles !== undefined) {
+    assignments.set("copy_files", serializeCopyFiles(patch.copyFiles));
+  }
+
+  return assignments;
+}
 
 class SqliteProjectRepository implements ProjectRepository {
   constructor(
@@ -253,54 +348,17 @@ class SqliteProjectRepository implements ProjectRepository {
     return projects;
   }
 
-  update(
-    id: string,
-    patch: {
-      name?: string;
-      claudeConfigPath?: string | null;
-      claudeMdPath?: string | null;
-      claudeDirPath?: string | null;
-      mcpConfigPath?: string | null;
-      copyFiles?: string[];
-    },
-  ): Project | null {
-    const sets: string[] = [];
-    const values: unknown[] = [];
+  update(id: string, patch: ProjectPatch): Project | null {
+    const assignments = buildProjectAssignments(patch);
 
-    if (patch.name !== undefined) {
-      sets.push("name = ?");
-      values.push(patch.name);
-    }
-    if (patch.claudeConfigPath !== undefined) {
-      sets.push("claude_config_path = ?");
-      values.push(normalizeConfigPath(patch.claudeConfigPath));
-    }
-    if (patch.claudeMdPath !== undefined) {
-      sets.push("claude_md_path = ?");
-      values.push(normalizeConfigPath(patch.claudeMdPath));
-    }
-    if (patch.claudeDirPath !== undefined) {
-      sets.push("claude_dir_path = ?");
-      values.push(normalizeConfigPath(patch.claudeDirPath));
-    }
-    if (patch.mcpConfigPath !== undefined) {
-      sets.push("mcp_config_path = ?");
-      values.push(normalizeConfigPath(patch.mcpConfigPath));
-    }
-    if (patch.copyFiles !== undefined) {
-      sets.push("copy_files = ?");
-      values.push(serializeCopyFiles(patch.copyFiles));
-    }
-
-    if (sets.length === 0) {
+    if (assignments.isEmpty) {
       /* Nothing to change; return the current state (or null if absent). */
       return this.getById(id);
     }
 
-    values.push(id);
     const result = this.db
-      .prepare(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?`)
-      .run(...(values as never[]));
+      .prepare(`UPDATE projects SET ${assignments.clause} WHERE id = ?`)
+      .run(...assignments.params(id));
     if (result.changes === 0) return null;
     return this.getById(id);
   }
@@ -360,31 +418,29 @@ class SqliteProjectRepoRepository implements ProjectRepoRepository {
   }
 
   update(repoId: string, patch: UpdateRepoDTO): ProjectRepo | null {
-    const sets: string[] = [];
-    const values: unknown[] = [];
+    const assignments = new UpdateAssignments();
 
     if (patch.setupScript !== undefined) {
-      sets.push("setup_script = ?");
-      values.push(normalizeConfigPath(patch.setupScript));
+      assignments.set("setup_script", normalizeConfigPath(patch.setupScript));
     }
     if (patch.runScript !== undefined) {
-      sets.push("run_script = ?");
-      values.push(normalizeConfigPath(patch.runScript));
+      assignments.set("run_script", normalizeConfigPath(patch.runScript));
     }
     if (patch.teardownScript !== undefined) {
-      sets.push("teardown_script = ?");
-      values.push(normalizeConfigPath(patch.teardownScript));
+      assignments.set(
+        "teardown_script",
+        normalizeConfigPath(patch.teardownScript),
+      );
     }
 
-    if (sets.length === 0) {
+    if (assignments.isEmpty) {
       /* Nothing to change; return the current state (or null if absent). */
       return this.getById(repoId);
     }
 
-    values.push(repoId);
     const result = this.db
-      .prepare(`UPDATE project_repos SET ${sets.join(", ")} WHERE id = ?`)
-      .run(...(values as never[]));
+      .prepare(`UPDATE project_repos SET ${assignments.clause} WHERE id = ?`)
+      .run(...assignments.params(repoId));
     if (result.changes === 0) return null;
     return this.getById(repoId);
   }
@@ -401,6 +457,83 @@ class SqliteProjectRepoRepository implements ProjectRepoRepository {
  * TaskRepository
  * ──────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Map a task patch onto its column assignments — only the fields the patch
+ * MENTIONS — and enforce the working ⇒ running invariant while doing it. Booleans
+ * are stored as 0/1, and `cavemanSession` keeps its third state (null = "no
+ * session has spawned yet") instead of collapsing to 0.
+ *
+ * The `updated_at` stamp is NOT set here: the caller adds it only when there is
+ * something to update, so a no-op patch does not touch the row.
+ */
+function buildTaskAssignments(patch: TaskPatch): UpdateAssignments {
+  // INVARIANT (working ⇒ running): a task whose live agent becomes "working"
+  // MUST live in the "running" column. Enforced here, in the single update
+  // chokepoint, so EVERY caller (lifecycle create/respawn, the agent-events
+  // activity hook) gets the auto-move for free without each remembering to set
+  // status. We only force the move when the SAME patch does not already set an
+  // explicit status — an explicit `patch.status` always wins (so a caller can
+  // still write {agentState:"working", status:"review"} deliberately). Note we
+  // do NOT clear agentState when status flips to a non-running value: display
+  // gating hides it instead, which avoids an erratic move↔re-work fight where a
+  // manual drag would yank the card back. Because every "working" write is a
+  // no-op when the state is unchanged (callers guard with `if (task.agentState
+  // === state) return;` before calling update), a card manually dragged out of
+  // "running" while already "working" is never re-forced back — only a fresh
+  // waiting→working transition (a new turn) reaches here and moves it.
+  const effectiveStatus =
+    patch.agentState === "working" && patch.status === undefined
+      ? "running"
+      : patch.status;
+
+  const assignments = new UpdateAssignments();
+
+  if (patch.title !== undefined) {
+    assignments.set("title", patch.title);
+  }
+  if (patch.description !== undefined) {
+    assignments.set("description", patch.description);
+  }
+  if (effectiveStatus !== undefined) {
+    assignments.set("status", effectiveStatus);
+  }
+  if (patch.slug !== undefined) {
+    assignments.set("slug", patch.slug);
+  }
+  if (patch.sessionRoot !== undefined) {
+    assignments.set("session_root", patch.sessionRoot);
+  }
+  if (patch.ptyPid !== undefined) {
+    assignments.set("pty_pid", patch.ptyPid);
+  }
+  if (patch.claudeSessionId !== undefined) {
+    assignments.set("claude_session_id", patch.claudeSessionId);
+  }
+  if (patch.port !== undefined) {
+    assignments.set("port", patch.port);
+  }
+  if (patch.agentState !== undefined) {
+    assignments.set("agent_state", patch.agentState);
+  }
+  if (patch.agentStateAt !== undefined) {
+    assignments.set("agent_state_at", patch.agentStateAt);
+  }
+  if (patch.cavemanEnabled !== undefined) {
+    assignments.set("caveman_enabled", patch.cavemanEnabled ? 1 : 0);
+  }
+  if (patch.cavemanLevel !== undefined) {
+    assignments.set("caveman_level", patch.cavemanLevel);
+  }
+  if (patch.cavemanSession !== undefined) {
+    assignments.set(
+      "caveman_session",
+      patch.cavemanSession === null ? null : patch.cavemanSession ? 1 : 0,
+    );
+  }
+
+  return assignments;
+}
+
 class SqliteTaskRepository implements TaskRepository {
   constructor(
     private readonly db: DB,
@@ -409,7 +542,7 @@ class SqliteTaskRepository implements TaskRepository {
 
   create(
     fields: Pick<Task, "projectId" | "title" | "description" | "slug"> &
-      Partial<Pick<Task, "status">>,
+      Partial<Pick<Task, "status" | "cavemanEnabled" | "cavemanLevel">>,
   ): Task {
     const id = nanoid();
     const ts = nowIso();
@@ -420,8 +553,9 @@ class SqliteTaskRepository implements TaskRepository {
         `INSERT INTO tasks
            (id, project_id, title, description, status, slug,
             session_root, pty_pid, claude_session_id, port,
+            caveman_enabled, caveman_level,
             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -430,6 +564,8 @@ class SqliteTaskRepository implements TaskRepository {
         fields.description ?? null,
         status,
         fields.slug,
+        fields.cavemanEnabled ? 1 : 0,
+        fields.cavemanLevel ?? null,
         ts,
         ts,
       );
@@ -476,81 +612,18 @@ class SqliteTaskRepository implements TaskRepository {
   }
 
   update(id: string, patch: TaskPatch): Task | null {
-    const sets: string[] = [];
-    const values: unknown[] = [];
+    const assignments = buildTaskAssignments(patch);
 
-    // INVARIANT (working ⇒ running): a task whose live agent becomes "working"
-    // MUST live in the "running" column. Enforced here, in the single update
-    // chokepoint, so EVERY caller (lifecycle create/respawn, the agent-events
-    // activity hook) gets the auto-move for free without each remembering to set
-    // status. We only force the move when the SAME patch does not already set an
-    // explicit status — an explicit `patch.status` always wins (so a caller can
-    // still write {agentState:"working", status:"review"} deliberately). Note we
-    // do NOT clear agentState when status flips to a non-running value: display
-    // gating hides it instead, which avoids an erratic move↔re-work fight where a
-    // manual drag would yank the card back. Because every "working" write is a
-    // no-op when the state is unchanged (callers guard with `if (task.agentState
-    // === state) return;` before calling update), a card manually dragged out of
-    // "running" while already "working" is never re-forced back — only a fresh
-    // waiting→working transition (a new turn) reaches here and moves it.
-    const effectiveStatus =
-      patch.agentState === "working" && patch.status === undefined
-        ? "running"
-        : patch.status;
-
-    if (patch.title !== undefined) {
-      sets.push("title = ?");
-      values.push(patch.title);
-    }
-    if (patch.description !== undefined) {
-      sets.push("description = ?");
-      values.push(patch.description);
-    }
-    if (effectiveStatus !== undefined) {
-      sets.push("status = ?");
-      values.push(effectiveStatus);
-    }
-    if (patch.slug !== undefined) {
-      sets.push("slug = ?");
-      values.push(patch.slug);
-    }
-    if (patch.sessionRoot !== undefined) {
-      sets.push("session_root = ?");
-      values.push(patch.sessionRoot);
-    }
-    if (patch.ptyPid !== undefined) {
-      sets.push("pty_pid = ?");
-      values.push(patch.ptyPid);
-    }
-    if (patch.claudeSessionId !== undefined) {
-      sets.push("claude_session_id = ?");
-      values.push(patch.claudeSessionId);
-    }
-    if (patch.port !== undefined) {
-      sets.push("port = ?");
-      values.push(patch.port);
-    }
-    if (patch.agentState !== undefined) {
-      sets.push("agent_state = ?");
-      values.push(patch.agentState);
-    }
-    if (patch.agentStateAt !== undefined) {
-      sets.push("agent_state_at = ?");
-      values.push(patch.agentStateAt);
-    }
-
-    if (sets.length === 0) {
+    if (assignments.isEmpty) {
       /* No-op patch: just touch updated_at and return current state. */
       return this.getById(id);
     }
 
-    sets.push("updated_at = ?");
-    values.push(nowIso());
-    values.push(id);
+    assignments.set("updated_at", nowIso());
 
     const result = this.db
-      .prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`)
-      .run(...(values as never[]));
+      .prepare(`UPDATE tasks SET ${assignments.clause} WHERE id = ?`)
+      .run(...assignments.params(id));
     if (result.changes === 0) return null;
     return this.getById(id);
   }

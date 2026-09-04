@@ -86,6 +86,9 @@ class RecordingPtyService implements PtyService {
   lastExit(_taskId: string): { exitCode: number; signal: number | null } | null {
     return null;
   }
+  getLastInputAt(_taskId: string): number | undefined {
+    return undefined;
+  }
   getIdleMs(_taskId: string): number | undefined {
     return this.idleMs;
   }

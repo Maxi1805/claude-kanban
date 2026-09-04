@@ -93,6 +93,9 @@ class ThrowingPtyService implements PtyService {
     return false;
   }
   write(): void {}
+  getLastInputAt(): number | undefined {
+    return undefined;
+  }
   resize(): void {}
   kill(taskId: string): void {
     this.killed.push(taskId);
@@ -138,6 +141,9 @@ class SuccessfulPtyService implements PtyService {
     return false;
   }
   write(): void {}
+  getLastInputAt(): number | undefined {
+    return undefined;
+  }
   resize(): void {}
   kill(): void {}
   onData(_taskId: string, _cb: PtyDataListener): Unsubscribe {
@@ -222,6 +228,9 @@ class FakeRepositories implements Repositories {
         sessionRoot: null,
         ptyPid: null,
         claudeSessionId: null,
+        cavemanEnabled: false,
+        cavemanLevel: null,
+        cavemanSession: null,
         port: null,
         createdAt: now,
         updatedAt: now,
@@ -705,6 +714,9 @@ class FakeResumePtyService implements PtyService {
     return this.live;
   }
   write(): void {}
+  getLastInputAt(): number | undefined {
+    return undefined;
+  }
   resize(): void {}
   kill(): void {}
   onData(_taskId: string, _cb: PtyDataListener): Unsubscribe {

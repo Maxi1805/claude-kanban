@@ -99,19 +99,7 @@ export class TaskLifecycleImpl implements ITaskLifecycle {
    * ────────────────────────────────────────────────────────────────────── */
 
   async createTask(dto: CreateTaskDTO): Promise<Task> {
-    const project = this.repos.projects.getById(dto.projectId);
-    if (!project) {
-      throw new Error(`Project ${dto.projectId} not found`);
-    }
-
-    // Resolve the repos this task spans: an explicit subset, or all of them.
-    const allRepos = this.repos.projectRepos.listByProject(project.id);
-    const selectedRepos = this.selectRepos(allRepos, dto.projectRepoIds);
-    if (selectedRepos.length === 0) {
-      throw new Error(
-        `Project "${project.name}" has no repos to create a task worktree for`,
-      );
-    }
+    const { project, selectedRepos } = this.resolveCreateTarget(dto);
 
     // 1. Slug + session root. The slug doubles as the branch name and the
     //    session-root leaf dir; makeSlug embeds a random id so it is unique.
@@ -123,105 +111,30 @@ export class TaskLifecycleImpl implements ITaskLifecycle {
     );
 
     // 2. Persist the task row first so it owns an id for the worktrees + pty.
-    const task = this.repos.tasks.create({
-      projectId: project.id,
-      title: dto.title,
-      description: dto.description ?? null,
-      slug,
-      status: "running",
-    });
-
-    // Persist the computed session root IMMEDIATELY — before any worktree is
-    // created — so that if rollback delegates to teardownTask after a partial
-    // failure, the teardown can find and remove the session-root dir (with its
-    // template CLAUDE.md/.claude symlinks) even though the worktree step never
-    // finished. teardownTask reads sessionRoot from the persisted row.
-    this.repos.tasks.update(task.id, { sessionRoot });
+    const task = this.persistTaskRow(dto, project, slug, sessionRoot);
 
     // Track side effects for rollback on a partial failure.
     let persistedRepos: TaskRepo[] = [];
 
     try {
-      // 3. Create one worktree per repo on a new `<slug>` branch.
-      const repoSpecs: WorktreeRepoSpec[] = selectedRepos.map((r) => ({
-        projectRepoId: r.id,
-        repoName: r.name,
-        repoPath: r.repoPath,
-        baseBranch: r.baseBranch,
-        setupScript: r.setupScript,
-      }));
-
-      const wt = await this.git.createTaskWorktrees({
-        taskId: task.id,
-        projectName: project.name,
+      // 3-5. Worktrees + session root + task_repos rows.
+      const workspace = await this.provisionWorkspace(
+        task.id,
+        project,
         slug,
-        repos: repoSpecs,
-        baseDir: config.worktreeBaseDir,
-        // Per-project untracked files to COPY into every repo's worktree after
-        // creation (best-effort; never fails task creation — see git-service).
-        copyFiles: project.copyFiles ?? [],
-      });
-
-      // 4. Assemble the session root (idempotent dir + two independent symlinks:
-      //    an explicit CLAUDE.md FILE and a .claude DIRECTORY). Precedence per
-      //    source, so existing projects (legacy folder) and the global fallback
-      //    keep working:
-      //      md  = project.claudeMdPath
-      //            ?? <legacy folder>/CLAUDE.md
-      //            ?? <global template>/CLAUDE.md
-      //      dir = project.claudeDirPath
-      //            ?? <legacy folder>/.claude
-      //            ?? <global template>/.claude
-      //      mcp = project.mcpConfigPath
-      //            ?? <legacy folder>/.mcp.json
-      //            ?? <global template>/.mcp.json
-      const { claudeMdPath, claudeDirPath, mcpConfigPath } =
-        resolveClaudeSources(project, config.templateRepoPath);
-      await this.git.assembleSessionRoot({
-        sessionRoot: wt.sessionRoot,
-        claudeMdPath,
-        claudeDirPath,
-        mcpConfigPath,
-      });
-
-      // Record the resolved session root on the task.
-      this.repos.tasks.update(task.id, { sessionRoot: wt.sessionRoot });
-
-      // 5. Persist the task_repos rows (strip the placeholder ids). Done BEFORE
-      //    the pty spawn so that a later failure's rollback (teardownTask) can
-      //    see — and remove — the worktrees from the DB.
-      persistedRepos = this.repos.taskRepos.createMany(
-        wt.taskRepos.map((tr) => ({
-          taskId: task.id,
-          projectRepoId: tr.projectRepoId,
-          repoName: tr.repoName,
-          branchName: tr.branchName,
-          worktreePath: tr.worktreePath,
-          remotePushed: tr.remotePushed,
-        })),
+        selectedRepos,
       );
+      persistedRepos = workspace.taskRepos;
 
       // (No auto-run here.) The repo run script is no longer launched at create
       // time with a pre-allocated port — running a repo (and allocating its
       // $PORT) is now a manual panel button handled by CommandRunnerService.
 
       // 6. Spawn the agent pty at the session root and persist its pid.
-      const taskWithRoot: Task = {
+      await this.spawnInitialAgent({
         ...task,
-        sessionRoot: wt.sessionRoot,
+        sessionRoot: workspace.sessionRoot,
         status: "running",
-      };
-      const handle = await this.pty.spawnForTask(taskWithRoot);
-      // A freshly spawned agent is alive but IDLE — waiting for the user's first
-      // prompt, NOT working. "working" means a turn is in progress and is set only
-      // by an activity hook (api/agent-events.ts). Keep the new task in the
-      // Corriendo column (explicit status="running"); it shows "te espera" there
-      // until the user starts a turn.
-      this.repos.tasks.update(task.id, {
-        ptyPid: handle.pid,
-        status: "running",
-        agentState: "waiting",
-        agentStateAt: new Date().toISOString(),
       });
     } catch (err) {
       // Roll back every side effect produced so far, then re-throw. Delegating
@@ -250,6 +163,162 @@ export class TaskLifecycleImpl implements ITaskLifecycle {
     });
 
     return finalTask;
+  }
+
+  /**
+   * Resolve what a create targets: the project row and the repos the task will
+   * span (an explicit subset, or all of them). Throws on an unknown project or
+   * an empty repo set — BEFORE any side effect is produced, so a rejected
+   * create leaves nothing behind.
+   */
+  private resolveCreateTarget(dto: CreateTaskDTO): {
+    project: Project;
+    selectedRepos: ProjectRepo[];
+  } {
+    const project = this.repos.projects.getById(dto.projectId);
+    if (!project) {
+      throw new Error(`Project ${dto.projectId} not found`);
+    }
+
+    const allRepos = this.repos.projectRepos.listByProject(project.id);
+    const selectedRepos = this.selectRepos(allRepos, dto.projectRepoIds);
+    if (selectedRepos.length === 0) {
+      throw new Error(
+        `Project "${project.name}" has no repos to create a task worktree for`,
+      );
+    }
+
+    return { project, selectedRepos };
+  }
+
+  /**
+   * Insert the task row and stamp its computed session root. Two writes on
+   * purpose: the row must exist (and own an id) before any worktree or pty, and
+   * the session root is persisted IMMEDIATELY — before any worktree is created —
+   * so that if rollback delegates to teardownTask after a partial failure, the
+   * teardown can find and remove the session-root dir (with its template
+   * CLAUDE.md/.claude symlinks) even though the worktree step never finished.
+   * teardownTask reads sessionRoot from the persisted row.
+   */
+  private persistTaskRow(
+    dto: CreateTaskDTO,
+    project: Project,
+    slug: string,
+    sessionRoot: string,
+  ): Task {
+    const task = this.repos.tasks.create({
+      projectId: project.id,
+      title: dto.title,
+      description: dto.description ?? null,
+      slug,
+      status: "running",
+      // Persisted BEFORE the spawn on purpose: the pty writes the task's
+      // `--settings` file from this row, so a task created with caveman ticked
+      // has the plugin loaded from its very first message.
+      cavemanEnabled: dto.cavemanEnabled === true,
+      cavemanLevel: dto.cavemanLevel ?? null,
+    });
+
+    this.repos.tasks.update(task.id, { sessionRoot });
+
+    return task;
+  }
+
+  /**
+   * Build the task's workspace on disk and in the DB: one git worktree per repo
+   * on a new `<slug>` branch, the assembled session root, and the persisted
+   * task_repos rows. Returns the RESOLVED session root (the one git actually
+   * used) and the persisted rows.
+   *
+   * The task_repos rows are written BEFORE the caller spawns the pty so that a
+   * later failure's rollback (teardownTask) can see — and remove — the
+   * worktrees from the DB. Every step here is side-effecting: a throw is caught
+   * by createTask's rollback.
+   */
+  private async provisionWorkspace(
+    taskId: string,
+    project: Project,
+    slug: string,
+    selectedRepos: ProjectRepo[],
+  ): Promise<{ sessionRoot: string; taskRepos: TaskRepo[] }> {
+    const repoSpecs: WorktreeRepoSpec[] = selectedRepos.map((r) => ({
+      projectRepoId: r.id,
+      repoName: r.name,
+      repoPath: r.repoPath,
+      baseBranch: r.baseBranch,
+      setupScript: r.setupScript,
+    }));
+
+    const wt = await this.git.createTaskWorktrees({
+      taskId,
+      projectName: project.name,
+      slug,
+      repos: repoSpecs,
+      baseDir: config.worktreeBaseDir,
+      // Per-project untracked files to COPY into every repo's worktree after
+      // creation (best-effort; never fails task creation — see git-service).
+      copyFiles: project.copyFiles ?? [],
+    });
+
+    // Assemble the session root (idempotent dir + two independent symlinks:
+    // an explicit CLAUDE.md FILE and a .claude DIRECTORY). Precedence per
+    // source, so existing projects (legacy folder) and the global fallback
+    // keep working:
+    //   md  = project.claudeMdPath
+    //         ?? <legacy folder>/CLAUDE.md
+    //         ?? <global template>/CLAUDE.md
+    //   dir = project.claudeDirPath
+    //         ?? <legacy folder>/.claude
+    //         ?? <global template>/.claude
+    //   mcp = project.mcpConfigPath
+    //         ?? <legacy folder>/.mcp.json
+    //         ?? <global template>/.mcp.json
+    const { claudeMdPath, claudeDirPath, mcpConfigPath } = resolveClaudeSources(
+      project,
+      config.templateRepoPath,
+    );
+    await this.git.assembleSessionRoot({
+      sessionRoot: wt.sessionRoot,
+      claudeMdPath,
+      claudeDirPath,
+      mcpConfigPath,
+    });
+
+    // Record the resolved session root on the task.
+    this.repos.tasks.update(taskId, { sessionRoot: wt.sessionRoot });
+
+    // Persist the task_repos rows (strip the placeholder ids).
+    const taskRepos = this.repos.taskRepos.createMany(
+      wt.taskRepos.map((tr) => ({
+        taskId,
+        projectRepoId: tr.projectRepoId,
+        repoName: tr.repoName,
+        branchName: tr.branchName,
+        worktreePath: tr.worktreePath,
+        remotePushed: tr.remotePushed,
+      })),
+    );
+
+    return { sessionRoot: wt.sessionRoot, taskRepos };
+  }
+
+  /**
+   * Spawn the agent pty for a freshly created task and persist its pid.
+   *
+   * A freshly spawned agent is alive but IDLE — waiting for the user's first
+   * prompt, NOT working. "working" means a turn is in progress and is set only
+   * by an activity hook (api/agent-events.ts). Keep the new task in the
+   * Corriendo column (explicit status="running"); it shows "te espera" there
+   * until the user starts a turn.
+   */
+  private async spawnInitialAgent(task: Task): Promise<void> {
+    const handle = await this.pty.spawnForTask(task);
+    this.repos.tasks.update(task.id, {
+      ptyPid: handle.pid,
+      status: "running",
+      agentState: "waiting",
+      agentStateAt: new Date().toISOString(),
+    });
   }
 
   /* ──────────────────────────────────────────────────────────────────────

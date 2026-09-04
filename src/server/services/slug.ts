@@ -53,16 +53,3 @@ export function makeSlug(title: string): string {
   const body = slugify(title);
   return body ? `${id}-${body}` : id;
 }
-
-/**
- * Ensure a slug is unique among `existing` slugs by appending a numeric suffix
- * when needed (e.g. "add-login", "add-login-2"). Retained for callers that
- * dedupe against a known set rather than relying on the random id prefix.
- */
-export function uniqueSlug(base: string, existing: readonly string[]): string {
-  const taken = new Set(existing);
-  if (!taken.has(base)) return base;
-  let n = 2;
-  while (taken.has(`${base}-${n}`)) n += 1;
-  return `${base}-${n}`;
-}

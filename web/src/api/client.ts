@@ -20,8 +20,9 @@ import type {
   FsInspectResponse,
   CommandKind,
   RunCommandResult,
-  DbOverviewResponse,
-  DbTableRowsResponse,
+  TaskSchemaResponse,
+  TaskSchemaRepo,
+  TaskCodeResponse,
 } from "@shared/types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
@@ -89,6 +90,12 @@ export interface ApiClient {
   getTask(id: string): Promise<Task>;
   createTask(dto: CreateTaskDTO): Promise<Task>;
   updateTask(id: string, dto: UpdateTaskDTO): Promise<Task>;
+  /**
+   * Restart a task's agent in place: the backend kills the pty and the terminal's
+   * reconnect revives it with `claude --continue`. The only way a plugin setting
+   * toggled mid-session takes effect. `restarted` is false when nothing was live.
+   */
+  restartAgent(id: string): Promise<{ task: Task; restarted: boolean }>;
   deleteTask(id: string): Promise<void>;
   // Per-repo commands: inject a lifecycle script into the repo's shell. `run`
   // exports a fresh $PORT first; the returned `port` is null for setup/teardown.
@@ -104,12 +111,34 @@ export interface ApiClient {
     opts?: { includeFiles?: boolean },
   ): Promise<FsListResponse>;
   fsInspect(path: string): Promise<FsInspectResponse>;
-  // Live DB viewer (read-only)
-  dbOverview(): Promise<DbOverviewResponse>;
-  dbTableRows(
-    table: string,
-    opts?: { limit?: number; offset?: number },
-  ): Promise<DbTableRowsResponse>;
+  // Declared schema of a task's worktrees (for the per-task diagram)
+  taskSchema(taskId: string): Promise<TaskSchemaResponse>;
+  /** Have an agent write this repo's extractor. Slow: it reads the codebase. */
+  generateSchemaScript(taskId: string, repoName: string): Promise<TaskSchemaRepo>;
+  deleteSchemaScript(taskId: string, repoName: string): Promise<void>;
+  // Code hotspots of a task's worktrees (for the per-task refactoring view).
+  // Analysis runs (and re-runs) server-side on request; `analyzing` on each
+  // repo tells the caller whether to keep polling.
+  // P3: `page` requests a slice of the already-ranked groups. OLA BA: el
+  // default del servidor dejó de ser 200 y pasó a ser TODO (BA1,
+  // `code-inspector.ts#resolvePage`), así que ausente ⇒ el repo entero. El
+  // panel ya no lo manda; el parámetro sigue porque el servidor lo sigue
+  // respetando si alguien pide una porción explícitamente. Aplica igual a
+  // cada repo de la tarea (ver `code-inspector.ts`).
+  taskCode(
+    taskId: string,
+    page?: { offset?: number; limit?: number | "unlimited" },
+  ): Promise<TaskCodeResponse>;
+  // F2: discard/restore a finding or opportunity by its stable id. Persists
+  // per repository, so it survives a re-analysis and every future task on
+  // the same repo, not just this one.
+  discardCodeFinding(
+    taskId: string,
+    repoName: string,
+    findingId: string,
+    reason: string,
+  ): Promise<void>;
+  restoreCodeFinding(taskId: string, repoName: string, findingId: string): Promise<void>;
 }
 
 class FetchApiClient implements ApiClient {
@@ -206,6 +235,13 @@ class FetchApiClient implements ApiClient {
     });
   }
 
+  restartAgent(id: string): Promise<{ task: Task; restarted: boolean }> {
+    return request<{ task: Task; restarted: boolean }>(
+      `/api/tasks/${encodeURIComponent(id)}/agent/restart`,
+      { method: "POST", headers: JSON_HEADERS },
+    );
+  }
+
   deleteTask(id: string): Promise<void> {
     return request<void>(`/api/tasks/${encodeURIComponent(id)}`, {
       method: "DELETE",
@@ -250,22 +286,65 @@ class FetchApiClient implements ApiClient {
     );
   }
 
-  /* ── Live DB viewer ───────────────────────────────────────────────── */
+  /* ── Per-task declared schema ─────────────────────────────────────── */
 
-  dbOverview(): Promise<DbOverviewResponse> {
-    return request<DbOverviewResponse>("/api/db");
+  taskSchema(taskId: string): Promise<TaskSchemaResponse> {
+    return request<TaskSchemaResponse>(
+      `/api/tasks/${encodeURIComponent(taskId)}/schema`,
+    );
   }
 
-  dbTableRows(
-    table: string,
-    opts?: { limit?: number; offset?: number },
-  ): Promise<DbTableRowsResponse> {
+  generateSchemaScript(taskId: string, repoName: string): Promise<TaskSchemaRepo> {
+    return request<TaskSchemaRepo>(
+      `/api/tasks/${encodeURIComponent(taskId)}/schema/${encodeURIComponent(
+        repoName,
+      )}/generate`,
+      { method: "POST" },
+    );
+  }
+
+  deleteSchemaScript(taskId: string, repoName: string): Promise<void> {
+    return request<void>(
+      `/api/tasks/${encodeURIComponent(taskId)}/schema/${encodeURIComponent(repoName)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  /* ── Per-task code hotspots ───────────────────────────────────────── */
+
+  taskCode(
+    taskId: string,
+    page?: { offset?: number; limit?: number | "unlimited" },
+  ): Promise<TaskCodeResponse> {
     const params = new URLSearchParams();
-    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
-    if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+    if (page?.offset !== undefined) params.set("offset", String(page.offset));
+    if (page?.limit !== undefined) params.set("limit", String(page.limit));
     const qs = params.toString();
-    return request<DbTableRowsResponse>(
-      `/api/db/tables/${encodeURIComponent(table)}/rows${qs ? `?${qs}` : ""}`,
+    return request<TaskCodeResponse>(
+      `/api/tasks/${encodeURIComponent(taskId)}/code${qs ? `?${qs}` : ""}`,
+    );
+  }
+
+  discardCodeFinding(
+    taskId: string,
+    repoName: string,
+    findingId: string,
+    reason: string,
+  ): Promise<void> {
+    return request<void>(
+      `/api/tasks/${encodeURIComponent(taskId)}/code/${encodeURIComponent(
+        repoName,
+      )}/findings/${encodeURIComponent(findingId)}/discard`,
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ reason }) },
+    );
+  }
+
+  restoreCodeFinding(taskId: string, repoName: string, findingId: string): Promise<void> {
+    return request<void>(
+      `/api/tasks/${encodeURIComponent(taskId)}/code/${encodeURIComponent(
+        repoName,
+      )}/findings/${encodeURIComponent(findingId)}/restore`,
+      { method: "POST" },
     );
   }
 }

@@ -43,6 +43,20 @@ function queryBool(value: unknown): boolean {
   return ["1", "true", "yes", "on"].includes(s.toLowerCase());
 }
 
+/**
+ * The single error translation both browsing routes do: a forbidden / invalid /
+ * missing path is the CALLER's mistake → 400 { error }. Anything else is not
+ * ours to interpret and is rethrown unchanged, so it keeps travelling exactly
+ * as before (unexpected → trailing JSON error handler, 500).
+ */
+function answerBrowseError(err: unknown, res: Response): void {
+  if (err instanceof FsBrowseError) {
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  throw err;
+}
+
 export function createFsRouter(deps: FsRouterDeps): Router {
   const { fsBrowser } = deps;
   const router = Router();
@@ -60,11 +74,7 @@ export function createFsRouter(deps: FsRouterDeps): Router {
       });
       res.json(listing);
     } catch (err) {
-      if (err instanceof FsBrowseError) {
-        res.status(400).json({ error: err.message });
-        return;
-      }
-      throw err; // unexpected → trailing JSON error handler (500)
+      answerBrowseError(err, res);
     }
   });
 
@@ -79,11 +89,7 @@ export function createFsRouter(deps: FsRouterDeps): Router {
       const inspected = await fsBrowser.inspect(path);
       res.json(inspected);
     } catch (err) {
-      if (err instanceof FsBrowseError) {
-        res.status(400).json({ error: err.message });
-        return;
-      }
-      throw err;
+      answerBrowseError(err, res);
     }
   });
 

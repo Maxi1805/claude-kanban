@@ -22,7 +22,9 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 
+import type { Task } from "../../shared/types.js";
 import { config } from "../config.js";
+import { resolveCavemanPluginId } from "./caveman.js";
 
 /** The Claude Code hook events we subscribe to. */
 const HOOK_EVENTS = [
@@ -47,10 +49,21 @@ interface HookMatcherGroup {
 /** The settings shape understood by `claude --settings`. */
 export interface AgentHooksSettings {
   hooks: Record<string, HookMatcherGroup[]>;
+  /**
+   * Per-plugin load switch, keyed `plugin@marketplace`. Present only in the
+   * PER-TASK settings file, where it carries the task's caveman checkbox. Both
+   * values matter: `true` loads the plugin into this session, and `false`
+   * actively keeps it out even when the user enabled it globally in their own
+   * settings.json — which is what makes the checkbox authoritative per task.
+   */
+  enabledPlugins?: Record<string, boolean>;
 }
 
 /** Default basename of the on-disk hooks settings file under the data dir. */
 const HOOKS_FILE_NAME = "claude-kanban-hooks.json";
+
+/** Subdirectory (under the data dir) holding one settings file per task. */
+const TASK_SETTINGS_DIR = "task-settings";
 
 /** Absolute URL the hooks POST each event to. Uses the configured server port. */
 export function agentEventsUrl(port: number = config.port): string {
@@ -109,4 +122,61 @@ export async function ensureAgentHooksFile(
   const json = JSON.stringify(buildAgentHooksSettings(port), null, 2);
   await fsp.writeFile(filePath, json, "utf8");
   return filePath;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Per-task settings
+ *
+ * The hooks are identical for every task, but the caveman checkbox is not — and
+ * `--settings` takes exactly one file. So each spawn gets its OWN file: the same
+ * hooks plus that task's `enabledPlugins`. The file is rewritten on every spawn,
+ * which is also how a checkbox toggled while the agent was down takes effect.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** The hooks settings plus the per-task plugin switches. */
+export function buildTaskAgentSettings(
+  task: Pick<Task, "cavemanEnabled">,
+  port: number = config.port,
+  pluginId: string = resolveCavemanPluginId(),
+): AgentHooksSettings {
+  return {
+    ...buildAgentHooksSettings(port),
+    enabledPlugins: { [pluginId]: task.cavemanEnabled === true },
+  };
+}
+
+/** Absolute path to a task's settings file under the data dir. */
+export function taskSettingsFilePath(
+  taskId: string,
+  dataDir: string = config.dataDir,
+): string {
+  return path.join(dataDir, TASK_SETTINGS_DIR, `${taskId}.json`);
+}
+
+/**
+ * Write the task's settings file (creating its directory) and return the path,
+ * for `claude --settings <file>`. Overwrites unconditionally so the file always
+ * reflects the task's CURRENT checkbox and the current port.
+ */
+export async function ensureTaskSettingsFile(
+  task: Pick<Task, "id" | "cavemanEnabled">,
+  dataDir: string = config.dataDir,
+  port: number = config.port,
+): Promise<string> {
+  const filePath = taskSettingsFilePath(task.id, dataDir);
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const json = JSON.stringify(buildTaskAgentSettings(task, port), null, 2);
+  await fsp.writeFile(filePath, json, "utf8");
+  return filePath;
+}
+
+/**
+ * Delete a task's settings file. Best-effort: a missing file is success, since
+ * the caller (task teardown) must never fail over a leftover.
+ */
+export async function removeTaskSettingsFile(
+  taskId: string,
+  dataDir: string = config.dataDir,
+): Promise<void> {
+  await fsp.rm(taskSettingsFilePath(taskId, dataDir), { force: true });
 }

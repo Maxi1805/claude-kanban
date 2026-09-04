@@ -12,6 +12,7 @@ export type {
   TaskRepo,
   TaskStatus,
   AgentState,
+  CavemanLevel,
   AddRepoDTO,
   CreateProjectRepoDTO,
   CreateProjectDTO,
@@ -24,13 +25,34 @@ export type {
   PtyMessage,
   BoardEventKind,
   BoardEventMsg,
-  DbChangedMsg,
-  DbColumn,
-  DbForeignKey,
-  DbTableInfo,
-  DbOverviewResponse,
-  DbCellValue,
-  DbTableRowsResponse,
+  SchemaField,
+  SchemaEntity,
+  SchemaRelation,
+  SchemaGraph,
+  SchemaChange,
+  SchemaDiff,
+  SchemaScriptInfo,
+  TaskSchemaRepo,
+  TaskSchemaResponse,
+  CodeLocation,
+  CodeSuggestion,
+  CodeSuggestionKind,
+  CodeAdvice,
+  CodeFindingKind,
+  KnownCodeFindingKind,
+  CodeFindingKindInfo,
+  CodeFinding,
+  CodeFindingHypothesis,
+  CodeFindingHypothesisCheck,
+  CodeFindingHypothesisLayer,
+  CodeFindingHypothesisState,
+  PatternConfidence,
+  PatternOpportunityPlace,
+  CodePatternOpportunity,
+  CodeAnalysis,
+  CodeFileSummary,
+  TaskCodeRepo,
+  TaskCodeResponse,
   WSMessage,
   ApiError,
   FsRoot,
@@ -39,6 +61,13 @@ export type {
   FsListResponse,
   FsInspectResponse,
 } from "@shared/types";
+
+/**
+ * RUNTIME re-exports (not types): the caveman level list backing the <select>
+ * and the level a freshly ticked checkbox means. Same source of truth the server
+ * validates against, so the UI can never offer a level the API rejects.
+ */
+export { CAVEMAN_LEVELS, CAVEMAN_DEFAULT_LEVEL, cavemanPending } from "@shared/types";
 
 /* ────────────────────────────────────────────────────────────────────────
  * Command panel — SHELL MODEL.

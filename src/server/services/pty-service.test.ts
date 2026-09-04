@@ -56,8 +56,13 @@ vi.mock("../config.js", () => ({
   projectRoot: process.cwd(),
 }));
 
-/** The hooks settings file the pty service appends via `--settings` for claude. */
-const HOOKS_FILE = path.join(configHolder.dataDir, "claude-kanban-hooks.json");
+/**
+ * The PER-TASK settings file a spawn writes and passes via `--settings`: the
+ * same hooks every task gets, plus that task's caveman plugin switch. The shared
+ * `claude-kanban-hooks.json` is only used when writing this one fails.
+ */
+const taskSettingsFile = (taskId: string): string =>
+  path.join(configHolder.dataDir, "task-settings", `${taskId}.json`);
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Mocked node-pty — a controllable fake process.
@@ -190,6 +195,9 @@ function makeTask(id: string, sessionRoot: string): Task {
     sessionRoot,
     ptyPid: null,
     claudeSessionId: null,
+    cavemanEnabled: false,
+    cavemanLevel: null,
+    cavemanSession: null,
     port: null,
     createdAt: now,
     updatedAt: now,
@@ -348,8 +356,44 @@ describe("PtyService output capture + replay", () => {
     const svc = new PtyServiceImpl();
     await svc.spawnForTask(makeTask("plain", tmp));
     expect(lastSpawn?.command).toBe("/usr/bin/claude");
-    // No --continue on a fresh spawn; the kanban --settings hooks file is appended.
-    expect(lastSpawn?.args).toEqual(["--foo", "--settings", HOOKS_FILE]);
+    // No --continue on a fresh spawn; the task's --settings file is appended.
+    expect(lastSpawn?.args).toEqual([
+      "--foo",
+      "--settings",
+      taskSettingsFile("plain"),
+    ]);
+  });
+
+  it("writes the spawned task's settings file with its caveman switch", async () => {
+    const svc = new PtyServiceImpl();
+    const task = { ...makeTask("cave", tmp), cavemanEnabled: true };
+    await svc.spawnForTask(task);
+
+    const written = JSON.parse(
+      await fs.readFile(taskSettingsFile("cave"), "utf8"),
+    ) as { hooks: Record<string, unknown>; enabledPlugins: Record<string, boolean> };
+
+    // The per-task file carries BOTH concerns: the agent-state hooks (unchanged
+    // for every task) and this task's plugin switch.
+    expect(Object.keys(written.hooks)).toContain("Stop");
+    const entries = Object.entries(written.enabledPlugins);
+    expect(entries).toHaveLength(1);
+    const [pluginId, enabled] = entries[0];
+    expect(pluginId).toMatch(/^caveman@/);
+    expect(enabled).toBe(true);
+  });
+
+  it("writes enabledPlugins=false for a task with caveman off", async () => {
+    const svc = new PtyServiceImpl();
+    await svc.spawnForTask(makeTask("nocave", tmp));
+
+    const written = JSON.parse(
+      await fs.readFile(taskSettingsFile("nocave"), "utf8"),
+    ) as { enabledPlugins: Record<string, boolean> };
+
+    // Explicitly FALSE, not absent: the task must keep the plugin out even when
+    // the user enabled it globally in their own settings.json.
+    expect(Object.values(written.enabledPlugins)).toEqual([false]);
   });
 
   it("spawnForTask(task, { resume: true }) appends config.agentResumeArgs", async () => {
@@ -358,13 +402,13 @@ describe("PtyService output capture + replay", () => {
     const svc = new PtyServiceImpl();
     await svc.spawnForTask(makeTask("resumed", tmp), { resume: true });
     // The resume args follow the default args (`claude --foo --continue`), then
-    // the kanban hooks file via --settings.
+    // the task's settings file via --settings.
     expect(lastSpawn?.command).toBe("/usr/bin/claude");
     expect(lastSpawn?.args).toEqual([
       "--foo",
       "--continue",
       "--settings",
-      HOOKS_FILE,
+      taskSettingsFile("resumed"),
     ]);
   });
 

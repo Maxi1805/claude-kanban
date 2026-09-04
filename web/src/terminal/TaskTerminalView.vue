@@ -18,17 +18,27 @@ import { storeToRefs } from "pinia";
 import { useBoardStore } from "../store";
 import { useTerminal, type TerminalConnectionStatus } from "./useTerminal";
 import CommandPanel from "./CommandPanel.vue";
+import CavemanToggle from "@/board/CavemanToggle.vue";
+import SchemaPanel from "@/schema/SchemaPanel.vue";
+import CodePanel from "@/code/CodePanel.vue";
 import "@xterm/xterm/css/xterm.css";
 
 const props = defineProps<{ id: string }>();
 
+/**
+ * Which pane fills the view. The terminal half stays mounted either way (see
+ * the template) so switching to the schema/code tabs and back never disturbs
+ * the pty.
+ */
+const tab = ref<"terminal" | "schema" | "code">("terminal");
+
 const store = useBoardStore();
 const { tasks } = storeToRefs(store);
 
-const title = computed(() => {
-  const task = tasks.value.find((t) => t.id === props.id);
-  return task?.title ?? props.id;
-});
+/** This task from the store, or null before the board has loaded. */
+const task = computed(() => tasks.value.find((t) => t.id === props.id) ?? null);
+
+const title = computed(() => task.value?.title ?? props.id);
 
 const terminalEl = ref<HTMLElement | null>(null);
 const { status, exitCode } = useTerminal(props.id, terminalEl);
@@ -139,7 +149,41 @@ onBeforeUnmount(() => {
         ← Volver al tablero
       </RouterLink>
       <h1 class="task-title">{{ title }}</h1>
-      <span class="conn-status" :data-status="status">
+
+      <nav class="task-tabs">
+        <button
+          type="button"
+          class="task-tab"
+          :class="{ 'task-tab--active': tab === 'terminal' }"
+          @click="tab = 'terminal'"
+        >
+          Terminal
+        </button>
+        <button
+          type="button"
+          class="task-tab"
+          :class="{ 'task-tab--active': tab === 'schema' }"
+          title="Esquema declarado por los archivos de esta tarea"
+          @click="tab = 'schema'"
+        >
+          Esquema
+        </button>
+        <button
+          type="button"
+          class="task-tab"
+          :class="{ 'task-tab--active': tab === 'code' }"
+          title="Hotspots de refactorización detectados en el código de esta tarea"
+          @click="tab = 'code'"
+        >
+          Código
+        </button>
+      </nav>
+
+      <!-- Same control as the board card: toggling here types the plugin's
+           command straight into the session shown below. -->
+      <CavemanToggle v-if="task" :task="task" />
+
+      <span v-show="tab === 'terminal'" class="conn-status" :data-status="status">
         {{ statusLabel[status]
         }}<template v-if="status === 'exited' && exitCode !== null">
           ({{ exitCode }})</template
@@ -147,7 +191,15 @@ onBeforeUnmount(() => {
       </span>
     </header>
 
-    <div ref="bodyEl" class="terminal-body" :class="{ 'terminal-body--dragging': dragging }">
+    <!-- The terminal pane stays MOUNTED across tab switches (v-show, not v-if)
+         so its pty session, scrollback and websocket survive a visit to the
+         schema tab. -->
+    <div
+      v-show="tab === 'terminal'"
+      ref="bodyEl"
+      class="terminal-body"
+      :class="{ 'terminal-body--dragging': dragging }"
+    >
       <!-- TOP: the claude terminal (flexes to fill the space above the split). -->
       <div ref="terminalEl" class="terminal-container" />
 
@@ -168,6 +220,14 @@ onBeforeUnmount(() => {
       <div class="terminal-cmd" :style="{ height: bottomHeight + 'px' }">
         <CommandPanel :task-id="props.id" />
       </div>
+    </div>
+
+    <div v-show="tab === 'schema'" class="task-schema">
+      <SchemaPanel :task-id="props.id" :active="tab === 'schema'" />
+    </div>
+
+    <div v-show="tab === 'code'" class="task-code">
+      <CodePanel :task-id="props.id" :active="tab === 'code'" />
     </div>
   </div>
 </template>
@@ -234,6 +294,40 @@ onBeforeUnmount(() => {
 
 .conn-status[data-status="exited"] {
   color: var(--ck-danger);
+}
+
+.task-tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: 6px;
+}
+
+.task-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ck-text-muted);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12.5px;
+}
+
+.task-tab:hover {
+  background: var(--ck-surface-hover);
+  color: var(--ck-text);
+}
+
+.task-tab--active {
+  background: var(--ck-surface-2);
+  border-color: var(--ck-border);
+  color: var(--ck-text);
+}
+
+/* The schema/code panes fill whatever the header leaves, and scroll internally. */
+.task-schema,
+.task-code {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .terminal-body {

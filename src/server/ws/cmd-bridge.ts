@@ -147,32 +147,7 @@ export function attach(
   if (bufferedExit.length > 0) emitExit(bufferedExit[0].exitCode);
 
   ws.on("message", (raw) => {
-    let msg: CmdMessage;
-    try {
-      msg = JSON.parse(raw.toString()) as CmdMessage;
-    } catch {
-      return; // ignore malformed frames
-    }
-    switch (msg.type) {
-      case "cmd:input":
-        if (typeof msg.data === "string") {
-          runner.write(taskId, repoId, msg.data);
-        }
-        break;
-      case "cmd:resize":
-        if (
-          Number.isFinite(msg.cols) &&
-          Number.isFinite(msg.rows) &&
-          msg.cols > 0 &&
-          msg.rows > 0
-        ) {
-          runner.resize(taskId, repoId, msg.cols, msg.rows);
-        }
-        break;
-      default:
-        // cmd:output / cmd:exit are server-originated; ignore if echoed back.
-        break;
-    }
+    applyInboundFrame(raw.toString(), addr, runner);
   });
 
   // Socket closed: detach listeners only. Deliberately do NOT kill the shell
@@ -183,6 +158,46 @@ export function attach(
   };
   ws.on("close", detach);
   ws.on("error", detach);
+}
+
+/**
+ * Apply one client → server frame to the repo's shell: keystrokes (`cmd:input`)
+ * and terminal geometry (`cmd:resize`). Malformed JSON, a non-string payload
+ * and a non-finite/non-positive geometry are all ignored rather than thrown — a
+ * bad frame must never tear down a live shell. `cmd:output` / `cmd:exit` are
+ * server-originated and ignored if echoed back.
+ */
+function applyInboundFrame(
+  raw: string,
+  addr: CmdAddress,
+  runner: CommandRunnerService,
+): void {
+  const { taskId, repoId } = addr;
+  let msg: CmdMessage;
+  try {
+    msg = JSON.parse(raw) as CmdMessage;
+  } catch {
+    return; // ignore malformed frames
+  }
+  switch (msg.type) {
+    case "cmd:input":
+      if (typeof msg.data === "string") {
+        runner.write(taskId, repoId, msg.data);
+      }
+      break;
+    case "cmd:resize":
+      if (
+        Number.isFinite(msg.cols) &&
+        Number.isFinite(msg.rows) &&
+        msg.cols > 0 &&
+        msg.rows > 0
+      ) {
+        runner.resize(taskId, repoId, msg.cols, msg.rows);
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 /** Parse the request URL into a pathname + searchParams (host is irrelevant). */

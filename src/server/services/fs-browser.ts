@@ -239,41 +239,8 @@ export class FsBrowserServiceImpl implements FsBrowserService {
     const list: FsEntry[] = [];
 
     for (const dirent of dirents) {
-      const name = dirent.name;
-
-      // `.git` is never navigable; deny-listed dirs are never surfaced.
-      if (name === ".git" || DENY_BASENAMES.has(name)) continue;
-
-      const full = path.join(dir, name);
-
-      // Use lstat so a symlink is detected as a symlink (not its target) — we
-      // skip symlinks to avoid loops and target chasing.
-      let lst;
-      try {
-        lst = await fs.lstat(full);
-      } catch {
-        continue; // unreadable entry → skip
-      }
-      if (lst.isSymbolicLink()) continue;
-
-      if (lst.isDirectory()) {
-        list.push({
-          path: full,
-          name,
-          isFile: false,
-          isGitRepo: isGitRepo(full),
-          hidden: name.startsWith("."),
-        });
-      } else if (opts.includeFiles && lst.isFile()) {
-        list.push({
-          path: full,
-          name,
-          isFile: true,
-          isGitRepo: false,
-          hidden: name.startsWith("."),
-        });
-      }
-      // Anything else (sockets, fifos, block/char devices) is ignored.
+      const entry = await this.classifyEntry(dir, dirent.name, opts);
+      if (entry) list.push(entry);
     }
 
     list.sort(compareEntries);
@@ -284,6 +251,53 @@ export class FsBrowserServiceImpl implements FsBrowserService {
       return { list: list.slice(0, MAX_ENTRIES), truncated: true };
     }
     return { list, truncated: false };
+  }
+
+  /**
+   * Decide what ONE child of `dir` is worth to the picker, returning its
+   * `FsEntry` or `null` when it must not be surfaced at all. Not surfaced:
+   * `.git` and deny-listed basenames, entries we cannot stat, symlinks (skipped
+   * to avoid loops and target chasing — hence `lstat`, which sees the link
+   * itself rather than its target), plain files when the caller did not ask for
+   * them, and everything that is neither a directory nor a regular file
+   * (sockets, fifos, block/char devices).
+   */
+  private async classifyEntry(
+    dir: string,
+    name: string,
+    opts: { includeFiles: boolean },
+  ): Promise<FsEntry | null> {
+    if (name === ".git" || DENY_BASENAMES.has(name)) return null;
+
+    const full = path.join(dir, name);
+
+    let lst;
+    try {
+      lst = await fs.lstat(full);
+    } catch {
+      return null; // unreadable entry → skip
+    }
+    if (lst.isSymbolicLink()) return null;
+
+    if (lst.isDirectory()) {
+      return {
+        path: full,
+        name,
+        isFile: false,
+        isGitRepo: isGitRepo(full),
+        hidden: name.startsWith("."),
+      };
+    }
+    if (opts.includeFiles && lst.isFile()) {
+      return {
+        path: full,
+        name,
+        isFile: true,
+        isGitRepo: false,
+        hidden: name.startsWith("."),
+      };
+    }
+    return null;
   }
 }
 

@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { config } from "../config.js";
+import { ensureEngineSchema } from "../services/engine/schema.js";
 
 export type DB = Database.Database;
 
@@ -35,6 +36,18 @@ export function initDb(dbPath: string = config.dbPath): DB {
 
   const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
   db.exec(schema);
+
+  // OLA BC, FRENTE BC1 — el DDL de las tres tablas del ANALIZADOR
+  // (`code_file_facts`/`code_finding_decisions`/`code_graphs`, más sus
+  // columnas aditivas) ya no vive en `schema.sql` ni en `migrate` de acá
+  // abajo: lo posee el motor, en `services/engine/schema.sql`, y lo aplica
+  // `ensureEngineSchema`. El efecto neto sobre la base es exactamente el que
+  // había antes de esta ola — mismo texto DDL, mismos `ADD COLUMN`
+  // guardados, aplicados en el mismo arranque. Lo que cambia es quién es
+  // dueño de la verdad: un consumidor del motor que abre su propia conexión
+  // llama a esta misma función y obtiene el MISMO esquema, sin pasar por
+  // `config.dbPath` ni por ninguna tabla del tablero.
+  ensureEngineSchema(db);
 
   migrate(db);
 
@@ -67,6 +80,19 @@ function migrate(db: DB): void {
   // transition. Added after the tasks table shipped, so guard with table_info.
   addColumnIfMissing(db, "tasks", "agent_state", "TEXT");
   addColumnIfMissing(db, "tasks", "agent_state_at", "TEXT");
+  // Per-task caveman switch (checkbox) + compression level (selector). Existing
+  // tasks default to OFF: the board never turns a token-saving plugin on behind
+  // the user's back. The level is nullable — an unset level means "the default".
+  addColumnIfMissing(db, "tasks", "caveman_enabled", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "tasks", "caveman_level", "TEXT");
+  // What the CURRENT session was spawned with (see Task.cavemanSession): the
+  // plugin is loaded once, at startup, so a checkbox toggled mid-session is
+  // pending until the agent respawns. NULL until the task spawns again.
+  addColumnIfMissing(db, "tasks", "caveman_session", "INTEGER");
+  // OLA BC, FRENTE BC1 — las tres columnas aditivas de `code_file_facts`
+  // (`facts_json`, `facts_schema_version`, `facts_blob`) se movieron a
+  // `ensureEngineSchema` (`services/engine/schema.ts`), que ya corrió más
+  // arriba en `initDb`. Son del motor, igual que la tabla.
 }
 
 /** True if `table` already has a column named `column`. */

@@ -9,14 +9,15 @@
  * Cross-module dependencies are referenced exclusively through the shared
  * service interfaces — never another module's concrete file.
  */
-import express, { Router, json } from "express";
+import { Router, json } from "express";
 import type { ErrorRequestHandler, Request, Response } from "express";
 import type {
+  CodeInspectorService,
   CommandRunnerService,
-  DbViewerService,
   FsBrowserService,
   PtyService,
   Repositories,
+  SchemaInspectorService,
   TaskLifecycle,
 } from "../../shared/interfaces.js";
 import { createProjectsRouter, type BoardEventEmitter } from "./projects.js";
@@ -24,7 +25,8 @@ import { createTasksRouter } from "./tasks.js";
 import { createCommandsRouter } from "./commands.js";
 import { createFsRouter } from "./fs.js";
 import { createAgentEventsRouter } from "./agent-events.js";
-import { createDbRouter } from "./db.js";
+import { createSchemaRouter } from "./schema.js";
+import { createCodeRouter } from "./code.js";
 
 export type { BoardEventEmitter } from "./projects.js";
 
@@ -48,10 +50,17 @@ export interface ApiDeps {
   /** Optional board-event broadcaster, wired by the server bootstrap. */
   emit?: BoardEventEmitter;
   /**
-   * Read-only live DB viewer backing the `/db` route. Optional so isolated
-   * tests can omit it; the /db routes are only mounted when present.
+   * Reads the schema a task's worktrees declare, for the per-task diagram.
+   * Optional so isolated tests can omit it; the route is only mounted when
+   * present.
    */
-  dbViewer?: DbViewerService;
+  schemaInspector?: SchemaInspectorService;
+  /**
+   * Surfaces tree-sitter refactor hotspots for a task's repos, for the
+   * per-task "Código" tab. Optional so isolated tests can omit it; the route
+   * is only mounted when present.
+   */
+  codeInspector?: CodeInspectorService;
 }
 
 /**
@@ -91,15 +100,37 @@ export function createApiRouter(deps: ApiDeps): Router {
       emit: deps.emit,
     }),
   );
+  mountTaskRouters(router, deps);
+  router.use("/fs", createFsRouter({ fsBrowser: deps.fsBrowser }));
+  router.use(apiErrorHandler);
+
+  return router;
+}
+
+/**
+ * Mount every router that shares the `/tasks` path, IN THE ORDER THAT MAKES
+ * THEM MATCH. The per-task sub-resource routers (`/:taskId/repos/.../run/:kind`,
+ * `/:taskId/schema`, `/:taskId/code`) go FIRST: the tasks router's own `/:id`
+ * would otherwise shadow them. Each optional router is mounted only when its
+ * service was injected, so isolated tests can omit it.
+ *
+ * Mount order is the whole contract of this function — keep the tasks router
+ * last.
+ */
+function mountTaskRouters(router: Router, deps: ApiDeps): void {
   // The command route shares the /tasks mount so its path reads
-  // /api/tasks/:taskId/repos/:repoId/run/:kind . Mounted BEFORE the tasks router
-  // so the specific command path matches first (the tasks router's /:id would
-  // otherwise shadow it). Only mounted when a runner is injected.
+  // /api/tasks/:taskId/repos/:repoId/run/:kind .
   if (deps.commandRunner) {
     router.use(
       "/tasks",
       createCommandsRouter({ runner: deps.commandRunner }),
     );
+  }
+  if (deps.schemaInspector) {
+    router.use("/tasks", createSchemaRouter({ inspector: deps.schemaInspector }));
+  }
+  if (deps.codeInspector) {
+    router.use("/tasks", createCodeRouter({ inspector: deps.codeInspector }));
   }
   router.use(
     "/tasks",
@@ -107,34 +138,23 @@ export function createApiRouter(deps: ApiDeps): Router {
       repos: deps.repos,
       lifecycle: deps.lifecycle,
       emit: deps.emit,
+      // Lets a caveman toggle reach the RUNNING session (the server types the
+      // plugin's command into the pty) instead of waiting for a respawn.
+      pty: deps.pty,
     }),
   );
-  router.use("/fs", createFsRouter({ fsBrowser: deps.fsBrowser }));
-  if (deps.dbViewer) {
-    router.use("/db", createDbRouter({ viewer: deps.dbViewer }));
-  }
-
-  const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
-    /* Surface a JSON parse failure from express.json() as a 400. */
-    if (err instanceof SyntaxError && "body" in err) {
-      res.status(400).json({ error: "Invalid JSON body" });
-      return;
-    }
-    const message = err instanceof Error ? err.message : "Internal server error";
-    res.status(500).json({ error: message });
-  };
-  router.use(errorHandler);
-
-  return router;
 }
 
 /**
- * Convenience: build a standalone Express app exposing the API under `/api`.
- * The server bootstrap may use this directly or mount {@link createApiRouter}
- * onto its own app alongside the WS upgrade handling.
+ * Trailing error handler: turns a route failure into a clean `{ error }` JSON
+ * envelope instead of Express's default HTML page.
  */
-export function createApiApp(deps: ApiDeps): express.Express {
-  const app = express();
-  app.use("/api", createApiRouter(deps));
-  return app;
-}
+const apiErrorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  /* Surface a JSON parse failure from express.json() as a 400. */
+  if (err instanceof SyntaxError && "body" in err) {
+    res.status(400).json({ error: "Invalid JSON body" });
+    return;
+  }
+  const message = err instanceof Error ? err.message : "Internal server error";
+  res.status(500).json({ error: message });
+};

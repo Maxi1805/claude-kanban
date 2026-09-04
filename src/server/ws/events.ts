@@ -12,10 +12,7 @@ import type { Duplex } from "node:stream";
 
 import { WebSocketServer, type WebSocket } from "ws";
 
-import type { BoardEventMsg, DbChangedMsg } from "../../shared/types.js";
-
-/** Frames this hub fans out: board mutations + live-DB change pings. */
-export type EventsHubMsg = BoardEventMsg | DbChangedMsg;
+import type { BoardEventMsg } from "../../shared/types.js";
 
 /** Path this hub owns. */
 const EVENTS_PATH = "/ws/events";
@@ -55,8 +52,8 @@ export class EventsHub {
     return wss;
   }
 
-  /** Broadcast an event frame to every connected client. */
-  broadcast(event: EventsHubMsg): void {
+  /** Broadcast a board event to every connected client. */
+  broadcast(event: BoardEventMsg): void {
     const frame = JSON.stringify(event);
     for (const ws of this.clients) {
       if (ws.readyState === ws.OPEN) {

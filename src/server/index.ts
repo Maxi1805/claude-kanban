@@ -29,19 +29,46 @@ import { CommandRunnerServiceImpl } from "./services/command-runner.js";
 import { FsBrowserServiceImpl } from "./services/fs-browser.js";
 import { TaskLifecycleImpl } from "./lifecycle/task-lifecycle.js";
 import { AgentActivityMonitor } from "./services/agent-activity-monitor.js";
-import { DbViewerServiceImpl } from "./services/db-viewer.js";
+import { SchemaInspectorServiceImpl } from "./services/schema-inspector.js";
+import { CodeInspectorServiceImpl } from "./services/code-inspector.js";
 import { createApiRouter, type BoardEventEmitter } from "./api/index.js";
 import { setup as setupPtyBridge } from "./ws/pty-bridge.js";
 import { setup as setupCmdBridge } from "./ws/cmd-bridge.js";
 import { createEventsHub } from "./ws/events.js";
 import { ensureAgentHooksFile } from "./services/agent-hooks.js";
+import { applyCavemanOnSpawn } from "./services/caveman.js";
 import type { BoardEventMsg } from "../shared/types.js";
 
 /** Absolute path to the built frontend (vite outputs to web/dist). */
 const WEB_DIST = path.join(projectRoot, "web", "dist");
 
 export async function main(): Promise<void> {
-  // ── Dependency graph ──────────────────────────────────────────────────────
+  const services = buildServices();
+
+  await prepareAgentHooksFile();
+  wireCavemanOnSpawn(services);
+
+  const server = createHttpServer(services);
+  attachWebSocketBridges(server, services);
+
+  clearStaleAgentStates(services);
+  // Start demoting quiet "working" tasks to "waiting" (promotion stays hook-driven).
+  services.activityMonitor.start();
+  await sweepOrphanWorktrees(services);
+
+  await listenAndAnnounce(server);
+}
+
+/** Everything {@link main} builds once and hands to the phases that follow. */
+type BootServices = ReturnType<typeof buildServices>;
+
+/**
+ * Instantiate the whole dependency graph, in dependency order: db →
+ * repositories → git/pty/command-runner/cleanup services → task lifecycle →
+ * the read-only inspectors and the activity monitor. Pure construction —
+ * nothing here listens, spawns, or reconciles.
+ */
+function buildServices() {
   const db = initDb(config.dbPath);
   const repos = createRepositories(db);
 
@@ -75,13 +102,18 @@ export async function main(): Promise<void> {
   // Read-only filesystem browser backing the repo picker (local-only).
   const fsBrowser = new FsBrowserServiceImpl(config);
 
-  // Live DB viewer: a SEPARATE read-only connection onto the same sqlite file
-  // (so app writes bump its `data_version`), polled to broadcast `db:changed`
-  // frames on the events channel. Powers the `/db` route.
-  const dbViewer = new DbViewerServiceImpl({
-    dbPath: config.dbPath,
-    broadcast: (msg) => eventsHub.broadcast(msg),
+  // Backs the per-task schema diagram: runs each repo's agent-generated
+  // extractor script and diffs the result against the repo's base branch.
+  // Opens no database and assumes no stack.
+  const schemaInspector = new SchemaInspectorServiceImpl(repos, {
+    dataDir: config.dataDir,
+    agentCommand: config.defaultAgentCommand,
   });
+
+  // Backs the per-task "Código" tab: tree-sitter hotspot detection per repo,
+  // cached against a cheap worktree signature so parsing only re-runs when
+  // the tree actually moved.
+  const codeInspector = new CodeInspectorServiceImpl(repos, db);
 
   // Owns the "waiting" half of agent state: demotes a "working" task to "waiting"
   // once its pty output goes quiet. Promotion to "working" is hook-driven (see
@@ -96,17 +128,88 @@ export async function main(): Promise<void> {
     idleThresholdMs: config.idleThresholdMs,
   });
 
-  // Materialize the Claude Code hooks settings file the spawned `claude` is given
-  // via `--settings` (per-task agent-state detection). Best-effort: a write
-  // failure must not block startup — the pty just spawns without the hooks.
+  return {
+    repos,
+    pty,
+    commandRunner,
+    cleanup,
+    lifecycle,
+    fsBrowser,
+    schemaInspector,
+    codeInspector,
+    eventsHub,
+    emit,
+    activityMonitor,
+  };
+}
+
+/**
+ * Materialize the Claude Code hooks settings file the spawned `claude` is given
+ * via `--settings` (per-task agent-state detection). Best-effort: a write
+ * failure must not block startup — the pty just spawns without the hooks.
+ * Each spawn then writes its OWN copy of this file (plus that task's caveman
+ * plugin switch); this shared one is the fallback when that write fails.
+ */
+async function prepareAgentHooksFile(): Promise<void> {
   try {
     const hooksFile = await ensureAgentHooksFile();
     console.log(`[boot] agent hooks settings ready at ${hooksFile}`);
   } catch (err) {
     console.error("[boot] failed to write agent hooks settings file:", err);
   }
+}
 
-  // ── HTTP ──────────────────────────────────────────────────────────────────
+/**
+ * Subscribe the caveman level application to every pty spawn (create, revive,
+ * respawn) and record what each session actually got.
+ */
+function wireCavemanOnSpawn({ pty, repos, emit }: BootServices): void {
+  // Caveman: the task's `--settings` file already decided whether the plugin is
+  // LOADED, but its compression LEVEL has no settings key — it is only settable
+  // by speaking to the session. So on every spawn (create, revive, respawn) we
+  // type the level command once the terminal settles. No-op for the plugin's own
+  // default level, which needs no command at all.
+  pty.onSpawn((taskId) => {
+    const task = repos.tasks.getById(taskId);
+    if (!task) return;
+    // Record what THIS session actually got. The settings file was written from
+    // this same row moments ago, so the plugin is loaded iff the checkbox was on
+    // at spawn. Everything after this — whether a live toggle can act, and the
+    // board's "pendiente" hint — is decided against this value, not the checkbox.
+    if (task.cavemanSession !== task.cavemanEnabled) {
+      const updated = repos.tasks.update(taskId, {
+        cavemanSession: task.cavemanEnabled,
+      });
+      if (updated) {
+        emit({
+          kind: "task:updated",
+          taskId,
+          projectId: updated.projectId,
+          task: updated,
+        });
+      }
+    }
+    void applyCavemanOnSpawn(pty, task).catch((err: unknown) => {
+      console.error(`[boot] failed to apply caveman level to ${taskId}:`, err);
+    });
+  });
+}
+
+/**
+ * Mount the HTTP API (and, in production, the built SPA with a history-API
+ * fallback) on a fresh http server. Returns it UNSTARTED: the ws bridges attach
+ * to it before anything listens.
+ */
+function createHttpServer({
+  repos,
+  lifecycle,
+  fsBrowser,
+  pty,
+  commandRunner,
+  emit,
+  schemaInspector,
+  codeInspector,
+}: BootServices): http.Server {
   const app = express();
   app.use(
     "/api",
@@ -117,7 +220,8 @@ export async function main(): Promise<void> {
       pty,
       commandRunner,
       emit,
-      dbViewer,
+      schemaInspector,
+      codeInspector,
     }),
   );
 
@@ -131,43 +235,53 @@ export async function main(): Promise<void> {
     });
   }
 
-  const server = http.createServer(app);
+  return http.createServer(app);
+}
 
-  // ── WebSocket bridges ───────────────────────────────────────────────────────
-  // Each bridge registers its own `upgrade` handler on the shared server and
-  // claims a single path, so the two channels coexist on one port:
-  //   • /ws/pty?taskId=<id>                  — bidirectional agent terminal I/O
-  //   • /ws/cmd?taskId=&repoId=               — bidirectional command shell I/O
-  //   • /ws/events                            — server → client board events
-  // Pass lifecycle.ensureAgent so the bridge revives a dead task's agent (with
-  // resume args, `claude --continue`) on connect — after a dev-server restart,
-  // a reboot, or the user exiting claude — before the terminal binds to its pty,
-  // so the conversation continues and input works again.
+/**
+ * Attach the three ws channels to the (not yet listening) http server.
+ *
+ * Each bridge registers its own `upgrade` handler on the shared server and
+ * claims a single path, so the three channels coexist on one port:
+ *   • /ws/pty?taskId=<id>                  — bidirectional agent terminal I/O
+ *   • /ws/cmd?taskId=&repoId=               — bidirectional command shell I/O
+ *   • /ws/events                            — server → client board events
+ *
+ * Pass lifecycle.ensureAgent so the pty bridge revives a dead task's agent (with
+ * resume args, `claude --continue`) on connect — after a dev-server restart, a
+ * reboot, or the user exiting claude — before the terminal binds to its pty, so
+ * the conversation continues and input works again.
+ */
+function attachWebSocketBridges(
+  server: http.Server,
+  { pty, commandRunner, lifecycle, eventsHub }: BootServices,
+): void {
   setupPtyBridge(server, pty, (taskId) => lifecycle.ensureAgent(taskId));
   setupCmdBridge(server, commandRunner);
   eventsHub.attach(server);
+}
 
-  // ── Boot-time reconciliation ────────────────────────────────────────────────
-  // After a (re)start NO per-task pty is live yet — every per-task claude process
-  // was killed when the server stopped. Any persisted agent_state ("working", …)
-  // is therefore stale and would make cards/sidebar show a phantom live agent.
-  // Clear it for all tasks; state is re-established when the user opens a task and
-  // its agent respawns (a Stop hook then flips it). Best-effort: never block boot.
+/**
+ * After a (re)start NO per-task pty is live yet — every per-task claude process
+ * was killed when the server stopped. Any persisted agent_state ("working", …)
+ * is therefore stale and would make cards/sidebar show a phantom live agent.
+ * Clear it for all tasks; state is re-established when the user opens a task and
+ * its agent respawns (a Stop hook then flips it). Best-effort: never block boot.
+ */
+function clearStaleAgentStates({ repos }: BootServices): void {
   try {
     repos.tasks.clearAllAgentStates();
     console.log("[boot] cleared stale agent_state for all tasks");
   } catch (err) {
     console.error("[boot] failed to clear stale agent states:", err);
   }
+}
 
-  // Start demoting quiet "working" tasks to "waiting" (promotion stays hook-driven).
-  activityMonitor.start();
-
-  // Start watching the sqlite file for commits so the /db viewer stays live.
-  dbViewer.start();
-
-  // Reclaim worktrees/branches left behind by tasks that were torn down
-  // uncleanly (e.g. a crash). Best-effort: never block startup on it.
+/**
+ * Reclaim worktrees/branches left behind by tasks that were torn down uncleanly
+ * (e.g. a crash). Best-effort: never block startup on it.
+ */
+async function sweepOrphanWorktrees({ cleanup }: BootServices): Promise<void> {
   try {
     const swept = await cleanup.sweepOrphans();
     if (
@@ -183,8 +297,13 @@ export async function main(): Promise<void> {
   } catch (err) {
     console.error("[boot] sweepOrphans failed:", err);
   }
+}
 
-  // ── Listen ────────────────────────────────────────────────────────────────
+/**
+ * Start listening and print the reachable endpoints. Resolves once the server
+ * is bound, so `main` only returns on a fully started board.
+ */
+async function listenAndAnnounce(server: http.Server): Promise<void> {
   await new Promise<void>((resolve) => {
     server.listen(config.port, () => {
       console.log(

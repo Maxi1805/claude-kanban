@@ -117,7 +117,6 @@ function realpathSafe(p: string): string {
 const NOTIFICATION_OUTPUT_IDLE_MS = 1500;
 
 export function createAgentEventsRouter(deps: AgentEventsRouterDeps): Router {
-  const { repos, pty, emit } = deps;
   const router = Router();
 
   // Read the hook payload as RAW TEXT (any content type) and parse it ourselves,
@@ -136,124 +135,127 @@ export function createAgentEventsRouter(deps: AgentEventsRouterDeps): Router {
     // STUCK at its last value forever. Parsing the already-buffered body is cheap;
     // answer, then do the real work off the response path. Any throw is swallowed
     // (logged) so hook processing can never surface as an error in the turn.
-    const body = parseBody(req.body);
+    const body = parseHookBody(req.body);
     res.status(200).json({ ok: true });
     setImmediate(() => {
       try {
-        handle(body);
+        applyHookEvent(deps, body);
       } catch (err) {
         console.error("[agent-events] hook processing failed:", err);
       }
     });
   });
 
-  /**
-   * Parse the request body into a hook-event object; {} on any failure.
-   *
-   * Accepts BOTH shapes so the handler is robust to whatever upstream body
-   * parser ran first:
-   *   • a raw string (this router's own `text()` parser, or no parser) — we
-   *     JSON.parse it ourselves so malformed input degrades to {} (never a 400);
-   *   • an already-parsed object — when an upstream `express.json()` consumed the
-   *     stream first (the API router mounts json() ahead of this sub-router), the
-   *     body arrives pre-parsed and must be used as-is, not re-stringified.
-   */
-  function parseBody(raw: unknown): HookEventBody {
-    if (typeof raw === "string") {
-      if (raw.length === 0) return {};
-      try {
-        const parsed = JSON.parse(raw) as unknown;
-        return parsed && typeof parsed === "object"
-          ? (parsed as HookEventBody)
-          : {};
-      } catch {
-        return {};
-      }
-    }
-    // Already parsed by an upstream JSON body parser (e.g. express.json()).
-    return raw && typeof raw === "object" ? (raw as HookEventBody) : {};
-  }
-
-  /**
-   * Resolve the owning task and apply the hook (both writes gated on a live pty):
-   *   • activity → set "working" (sticky) + bump the activity clock so the
-   *     monitor's long stale-fallback timer restarts.
-   *   • idle     → set "waiting".
-   * Never throws out.
-   */
-  function handle(body: HookEventBody): void {
-    const eventName =
-      typeof body.hook_event_name === "string" ? body.hook_event_name : "";
-    const cwd = typeof body.cwd === "string" ? body.cwd : "";
-
-    if (!eventName || !cwd) return; // nothing actionable
-
-    const nudge = hookNudge(eventName);
-    if (nudge === null) return; // event we don't track
-
-    const task = resolveTaskByCwd(cwd);
-    if (!task) return; // unknown cwd → 200, do nothing
-
-    // Only act on a task whose agent is actually live; a dead task's state is
-    // owned by the pty-exit path (cleared to null) — never resurrect it.
-    if (!pty?.has(task.id)) return;
-
-    if (nudge === "idle") {
-      // A late/stale Notification can land AFTER the user already answered the
-      // prompt and the agent resumed — it must not clobber active work. Honor a
-      // Notification only when output is actually idle; Stop always wins (the turn
-      // really ended).
-      if (
-        eventName === "Notification" &&
-        (pty?.getIdleMs(task.id) ?? Number.POSITIVE_INFINITY) <
-          NOTIFICATION_OUTPUT_IDLE_MS
-      ) {
-        return; // agent is actively producing output → ignore the stale notification
-      }
-      setState(task, "waiting");
-      return;
-    }
-
-    // activity → PROMOTE to "working" and keep it STICKY for the whole turn (the
-    // monitor never demotes a still-streaming task). Bump the activity clock so
-    // the monitor's long stale-fallback timer restarts.
-    pty.markActivity(task.id);
-    setState(task, "working");
-  }
-
-  /** Persist a new agentState (no-op when unchanged) and broadcast task:updated. */
-  function setState(task: Task, state: AgentState): void {
-    if (task.agentState === state) return;
-    const updated = repos.tasks.update(task.id, {
-      agentState: state,
-      agentStateAt: new Date().toISOString(),
-    });
-    if (!updated) return;
-    // Broadcast the hydrated task so the board upserts it on `task:updated`.
-    const hydrated: Task =
-      repos.tasks.getById(updated.id, { withRepos: true }) ?? updated;
-    emit?.({
-      kind: "task:updated",
-      taskId: hydrated.id,
-      projectId: hydrated.projectId,
-      task: hydrated,
-    });
-  }
-
-  /**
-   * Find the task whose `sessionRoot` matches `cwd`. Both sides are resolved
-   * through realpath so a symlinked session root still matches the cwd claude
-   * reports. Returns null when no task matches (the caller responds 200, no-op).
-   */
-  function resolveTaskByCwd(cwd: string): Task | null {
-    const target = realpathSafe(cwd);
-    const tasks = repos.tasks.list();
-    for (const task of tasks) {
-      if (!task.sessionRoot) continue;
-      if (realpathSafe(task.sessionRoot) === target) return task;
-    }
-    return null;
-  }
-
   return router;
+}
+
+/**
+ * Parse the request body into a hook-event object; {} on any failure.
+ *
+ * Accepts BOTH shapes so the handler is robust to whatever upstream body
+ * parser ran first:
+ *   • a raw string (this router's own `text()` parser, or no parser) — we
+ *     JSON.parse it ourselves so malformed input degrades to {} (never a 400);
+ *   • an already-parsed object — when an upstream `express.json()` consumed the
+ *     stream first (the API router mounts json() ahead of this sub-router), the
+ *     body arrives pre-parsed and must be used as-is, not re-stringified.
+ */
+function parseHookBody(raw: unknown): HookEventBody {
+  if (typeof raw === "string") {
+    if (raw.length === 0) return {};
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed && typeof parsed === "object" ? (parsed as HookEventBody) : {};
+    } catch {
+      return {};
+    }
+  }
+  // Already parsed by an upstream JSON body parser (e.g. express.json()).
+  return raw && typeof raw === "object" ? (raw as HookEventBody) : {};
+}
+
+/**
+ * Resolve the owning task and apply the hook (both writes gated on a live pty):
+ *   • activity → set "working" (sticky) + bump the activity clock so the
+ *     monitor's long stale-fallback timer restarts.
+ *   • idle     → set "waiting".
+ * Never throws out.
+ */
+function applyHookEvent(deps: AgentEventsRouterDeps, body: HookEventBody): void {
+  const { pty } = deps;
+  const eventName =
+    typeof body.hook_event_name === "string" ? body.hook_event_name : "";
+  const cwd = typeof body.cwd === "string" ? body.cwd : "";
+
+  if (!eventName || !cwd) return; // nothing actionable
+
+  const nudge = hookNudge(eventName);
+  if (nudge === null) return; // event we don't track
+
+  const task = resolveTaskByCwd(deps.repos, cwd);
+  if (!task) return; // unknown cwd → 200, do nothing
+
+  // Only act on a task whose agent is actually live; a dead task's state is
+  // owned by the pty-exit path (cleared to null) — never resurrect it.
+  if (!pty?.has(task.id)) return;
+
+  if (nudge === "idle") {
+    // A late/stale Notification can land AFTER the user already answered the
+    // prompt and the agent resumed — it must not clobber active work. Honor a
+    // Notification only when output is actually idle; Stop always wins (the turn
+    // really ended).
+    if (
+      eventName === "Notification" &&
+      (pty?.getIdleMs(task.id) ?? Number.POSITIVE_INFINITY) <
+        NOTIFICATION_OUTPUT_IDLE_MS
+    ) {
+      return; // agent is actively producing output → ignore the stale notification
+    }
+    setAgentState(deps, task, "waiting");
+    return;
+  }
+
+  // activity → PROMOTE to "working" and keep it STICKY for the whole turn (the
+  // monitor never demotes a still-streaming task). Bump the activity clock so
+  // the monitor's long stale-fallback timer restarts.
+  pty.markActivity(task.id);
+  setAgentState(deps, task, "working");
+}
+
+/** Persist a new agentState (no-op when unchanged) and broadcast task:updated. */
+function setAgentState(
+  deps: AgentEventsRouterDeps,
+  task: Task,
+  state: AgentState,
+): void {
+  if (task.agentState === state) return;
+  const updated = deps.repos.tasks.update(task.id, {
+    agentState: state,
+    agentStateAt: new Date().toISOString(),
+  });
+  if (!updated) return;
+  // Broadcast the hydrated task so the board upserts it on `task:updated`.
+  const hydrated: Task =
+    deps.repos.tasks.getById(updated.id, { withRepos: true }) ?? updated;
+  deps.emit?.({
+    kind: "task:updated",
+    taskId: hydrated.id,
+    projectId: hydrated.projectId,
+    task: hydrated,
+  });
+}
+
+/**
+ * Find the task whose `sessionRoot` matches `cwd`. Both sides are resolved
+ * through realpath so a symlinked session root still matches the cwd claude
+ * reports. Returns null when no task matches (the caller responds 200, no-op).
+ */
+function resolveTaskByCwd(repos: Repositories, cwd: string): Task | null {
+  const target = realpathSafe(cwd);
+  const tasks = repos.tasks.list();
+  for (const task of tasks) {
+    if (!task.sessionRoot) continue;
+    if (realpathSafe(task.sessionRoot) === target) return task;
+  }
+  return null;
 }

@@ -106,51 +106,9 @@ export class GitServiceImpl implements GitServiceContract {
 
     try {
       for (const repo of opts.repos) {
-        const worktreePath = path.join(sessionRoot, repo.repoName);
-        const branchName = await this.resolveBranchName(
-          repo.repoPath,
-          opts.slug,
+        taskRepos.push(
+          await this.addRepoWorktree(repo, opts, sessionRoot, created),
         );
-
-        await this.run(
-          [
-            "worktree",
-            "add",
-            worktreePath,
-            "-b",
-            branchName,
-            repo.baseBranch,
-          ],
-          repo.repoPath,
-        );
-
-        created.push({ repoPath: repo.repoPath, worktreePath, branch: branchName });
-
-        // Copy configured untracked files (e.g. `.env`, secrets, local-only
-        // fixtures) from the ORIGINAL repo working dir into the fresh worktree.
-        // Best-effort by contract: a missing/unsafe pattern or a copy error is
-        // swallowed and NEVER fails worktree/task creation.
-        //
-        // The repo's SETUP SCRIPT is NOT run here anymore — setup is now a manual
-        // panel button handled by CommandRunnerService, so worktree creation just
-        // provisions files and leaves running scripts to the user.
-        await this.copyUntrackedFiles(
-          repo.repoPath,
-          worktreePath,
-          opts.copyFiles,
-        );
-
-        taskRepos.push({
-          // Persisted id is assigned by the repository layer; a stable
-          // placeholder keeps the shape valid for callers that do not persist.
-          id: "",
-          taskId: opts.taskId,
-          projectRepoId: repo.projectRepoId,
-          repoName: repo.repoName,
-          branchName,
-          worktreePath,
-          remotePushed: false,
-        });
       }
     } catch (err) {
       // Roll back every worktree + branch created so far, then surface the error.
@@ -159,6 +117,54 @@ export class GitServiceImpl implements GitServiceContract {
     }
 
     return { sessionRoot, taskRepos };
+  }
+
+  /**
+   * Provision ONE repo's worktree under `sessionRoot`: cut its task branch, add
+   * the worktree, and seed it with the configured untracked files. Returns the
+   * TaskRepo row describing it.
+   *
+   * `created` is the caller's rollback ledger: the entry is appended the moment
+   * `worktree add` succeeds, so a failure in any LATER step (here or on a
+   * subsequent repo) still tears this tree down.
+   */
+  private async addRepoWorktree(
+    repo: CreateTaskWorktreesOptions["repos"][number],
+    opts: CreateTaskWorktreesOptions,
+    sessionRoot: string,
+    created: Array<{ repoPath: string; worktreePath: string; branch: string }>,
+  ): Promise<TaskRepo> {
+    const worktreePath = path.join(sessionRoot, repo.repoName);
+    const branchName = await this.resolveBranchName(repo.repoPath, opts.slug);
+
+    await this.run(
+      ["worktree", "add", worktreePath, "-b", branchName, repo.baseBranch],
+      repo.repoPath,
+    );
+
+    created.push({ repoPath: repo.repoPath, worktreePath, branch: branchName });
+
+    // Copy configured untracked files (e.g. `.env`, secrets, local-only
+    // fixtures) from the ORIGINAL repo working dir into the fresh worktree.
+    // Best-effort by contract: a missing/unsafe pattern or a copy error is
+    // swallowed and NEVER fails worktree/task creation.
+    //
+    // The repo's SETUP SCRIPT is NOT run here anymore — setup is now a manual
+    // panel button handled by CommandRunnerService, so worktree creation just
+    // provisions files and leaves running scripts to the user.
+    await this.copyUntrackedFiles(repo.repoPath, worktreePath, opts.copyFiles);
+
+    return {
+      // Persisted id is assigned by the repository layer; a stable
+      // placeholder keeps the shape valid for callers that do not persist.
+      id: "",
+      taskId: opts.taskId,
+      projectRepoId: repo.projectRepoId,
+      repoName: repo.repoName,
+      branchName,
+      worktreePath,
+      remotePushed: false,
+    };
   }
 
   /**
@@ -211,62 +217,7 @@ export class GitServiceImpl implements GitServiceContract {
           : [pattern];
 
         for (const rel of relPaths) {
-          const src = path.resolve(repoRoot, rel);
-          const dest = path.resolve(worktreeRoot, rel);
-          // SECURITY: confirm the resolved paths stay inside their roots — a
-          // belt-and-braces check on top of the pattern validation above.
-          if (!isWithin(repoRoot, src) || !isWithin(worktreeRoot, dest)) {
-            console.warn(
-              `[git-service] skipping copyFiles pattern escaping its root: ${rel}`,
-            );
-            continue;
-          }
-          // Skip patterns that do not exist in the source repo. Use lstat so a
-          // dangling/escaping symlink is still observed (access() would follow
-          // it and may report it missing or reach outside the repo).
-          let lst;
-          try {
-            lst = await fs.lstat(src);
-          } catch {
-            continue;
-          }
-
-          // SECURITY: the lexical isWithin() check cannot see through symlinks.
-          // Resolve the REAL on-disk path and re-assert containment so a symlink
-          // (file OR directory) inside the repo pointing OUTSIDE cannot be chased
-          // to exfiltrate outside content into the worktree. A symlink whose
-          // target does not exist (dangling) has no realpath → skip it too.
-          let realSrc: string;
-          try {
-            realSrc = await fs.realpath(src);
-          } catch {
-            if (lst.isSymbolicLink()) {
-              console.warn(
-                `[git-service] skipping copyFiles symlink with unresolvable target: ${rel}`,
-              );
-              continue;
-            }
-            // A non-symlink that vanished between lstat and realpath — skip.
-            continue;
-          }
-          if (!isWithin(repoRoot, realSrc)) {
-            console.warn(
-              `[git-service] skipping copyFiles entry whose real path escapes the repo: ${rel}`,
-            );
-            continue;
-          }
-
-          await fs.mkdir(path.dirname(dest), { recursive: true });
-          // `dereference: false` (+ verbatimSymlinks) so nested symlinks inside a
-          // copied directory are PRESERVED, never walked into and materialised as
-          // real files. Combined with the realpath check above, the top-level
-          // entry is guaranteed in-repo, and any inner symlink that escapes stays
-          // an inert (dangling-in-worktree) link rather than copied-out data.
-          await fs.cp(src, dest, {
-            recursive: true,
-            dereference: false,
-            verbatimSymlinks: true,
-          });
+          await this.copyContainedEntry(repoRoot, worktreeRoot, rel);
         }
       } catch (err) {
         // Swallow + log: a copy error must never fail worktree/task creation.
@@ -276,6 +227,74 @@ export class GitServiceImpl implements GitServiceContract {
         );
       }
     }
+  }
+
+  /**
+   * Copy ONE concrete relative entry `rel` from `repoRoot` into `worktreeRoot`,
+   * but only after proving it cannot reach outside either root. The proof is in
+   * three layers, and the entry is skipped (with a warning where the cause is a
+   * suspicious pattern rather than a plain absence) if any of them fails:
+   *
+   *  1. LEXICAL — both resolved paths must stay within their roots.
+   *  2. EXISTENCE — `lstat` (not `access`) so a dangling or escaping symlink is
+   *     observed as itself rather than followed.
+   *  3. REAL PATH — the lexical check cannot see through symlinks, so the source's
+   *     real on-disk path is resolved and re-asserted to be inside the repo. A
+   *     symlink (file OR directory) pointing outside is rejected, never chased.
+   *
+   * The copy itself keeps `dereference: false` (+ verbatimSymlinks) so nested
+   * symlinks inside a copied directory are PRESERVED, never walked into and
+   * materialised as real files: the top-level entry is guaranteed in-repo by the
+   * realpath check, and any inner symlink that escapes stays an inert
+   * (dangling-in-worktree) link rather than copied-out data.
+   */
+  private async copyContainedEntry(
+    repoRoot: string,
+    worktreeRoot: string,
+    rel: string,
+  ): Promise<void> {
+    const src = path.resolve(repoRoot, rel);
+    const dest = path.resolve(worktreeRoot, rel);
+    if (!isWithin(repoRoot, src) || !isWithin(worktreeRoot, dest)) {
+      console.warn(
+        `[git-service] skipping copyFiles pattern escaping its root: ${rel}`,
+      );
+      return;
+    }
+
+    let lst;
+    try {
+      lst = await fs.lstat(src);
+    } catch {
+      return; // not present in the source repo → nothing to copy
+    }
+
+    let realSrc: string;
+    try {
+      realSrc = await fs.realpath(src);
+    } catch {
+      if (lst.isSymbolicLink()) {
+        console.warn(
+          `[git-service] skipping copyFiles symlink with unresolvable target: ${rel}`,
+        );
+        return;
+      }
+      // A non-symlink that vanished between lstat and realpath — skip.
+      return;
+    }
+    if (!isWithin(repoRoot, realSrc)) {
+      console.warn(
+        `[git-service] skipping copyFiles entry whose real path escapes the repo: ${rel}`,
+      );
+      return;
+    }
+
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.cp(src, dest, {
+      recursive: true,
+      dereference: false,
+      verbatimSymlinks: true,
+    });
   }
 
   /**
@@ -563,32 +582,8 @@ export class GitServiceImpl implements GitServiceContract {
    * infer "busy" from a non-zero exit with leftover stdout.
    */
   private async pathHasOpenFiles(worktreePath: string): Promise<boolean> {
-    let stdout = "";
-    try {
-      // -F p → machine-readable, one field per line; pid lines start with "p".
-      const res = await execFileAsync("lsof", ["-w", "-F", "p", "+D", worktreePath], {
-        timeout: 5000,
-        maxBuffer: 4 * 1024 * 1024,
-      });
-      stdout = res.stdout.toString();
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & {
-        code?: number | string;
-        stdout?: string | Buffer;
-      };
-      if (e && e.code === "ENOENT") return false; // lsof not installed → not busy
-      // Non-zero exit: lsof still prints matches it found to stdout. Parse those
-      // (a genuine match means a live holder); no parseable stdout ⇒ not busy.
-      stdout = e.stdout ? e.stdout.toString() : "";
-    }
-
-    const pids = new Set<number>();
-    for (const line of stdout.split(/\r?\n/)) {
-      if (line.startsWith("p")) {
-        const pid = Number.parseInt(line.slice(1), 10);
-        if (Number.isInteger(pid) && pid > 0) pids.add(pid);
-      }
-    }
+    const stdout = await runLsofUnder(worktreePath);
+    const pids = parseLsofPids(stdout);
     if (pids.size === 0) return false;
 
     // Only a process that is STILL alive counts. A pid we just SIGKILLed may
@@ -751,6 +746,44 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Run `lsof` over everything under `dirPath` and return whatever it printed on
+ * stdout. Never throws: a missing `lsof` yields `""` (nothing can be reported
+ * busy), and a non-zero exit still yields the matches lsof managed to print —
+ * its exit code is not a usable busy signal, only its output is.
+ */
+async function runLsofUnder(dirPath: string): Promise<string> {
+  try {
+    // -F p → machine-readable, one field per line; pid lines start with "p".
+    const res = await execFileAsync("lsof", ["-w", "-F", "p", "+D", dirPath], {
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return res.stdout.toString();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & {
+      code?: number | string;
+      stdout?: string | Buffer;
+    };
+    if (e && e.code === "ENOENT") return ""; // lsof not installed → not busy
+    // Non-zero exit: lsof still prints matches it found to stdout. Parse those
+    // (a genuine match means a live holder); no parseable stdout ⇒ not busy.
+    return e.stdout ? e.stdout.toString() : "";
+  }
+}
+
+/** Collect the pids from `lsof -F p` output (pid lines look like `p1234`). */
+function parseLsofPids(stdout: string): Set<number> {
+  const pids = new Set<number>();
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.startsWith("p")) {
+      const pid = Number.parseInt(line.slice(1), 10);
+      if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+    }
+  }
+  return pids;
+}
+
 /** True if `pid` still exists (signal 0 probe; EPERM ⇒ exists). */
 function isPidAlive(pid: number): boolean {
   try {
@@ -775,37 +808,48 @@ export function parsePorcelainWorktrees(stdout: string): WorktreeInfo[] {
     .filter((b) => b.length > 0);
 
   blocks.forEach((block, index) => {
-    let wtPath: string | null = null;
-    let head: string | null = null;
-    let branch: string | null = null;
-    let locked = false;
-
-    for (const line of block.split(/\r?\n/)) {
-      if (line.startsWith("worktree ")) {
-        wtPath = line.slice("worktree ".length).trim();
-      } else if (line.startsWith("HEAD ")) {
-        head = line.slice("HEAD ".length).trim();
-      } else if (line.startsWith("branch ")) {
-        const ref = line.slice("branch ".length).trim();
-        branch = ref.replace(/^refs\/heads\//, "");
-      } else if (line === "locked" || line.startsWith("locked ")) {
-        locked = true;
-      }
-    }
-
-    if (!wtPath) return;
+    const record = parseWorktreeRecord(block);
+    // A record without a `worktree` line is not a worktree — skip it.
+    if (!record) return;
 
     result.push({
-      path: wtPath,
-      branch,
-      head,
+      ...record,
       // The first record is always the repo's primary (non-linked) worktree.
       isMain: index === 0,
-      locked,
     });
   });
 
   return result;
+}
+
+/**
+ * Parse ONE porcelain record (the lines of a single blank-line-separated block)
+ * into its fields. Returns `null` when the block carries no `worktree` line,
+ * which is the only thing that makes a record a worktree. `isMain` is not
+ * decided here: it depends on the record's position in the whole listing.
+ */
+function parseWorktreeRecord(block: string): Omit<WorktreeInfo, "isMain"> | null {
+  let wtPath: string | null = null;
+  let head: string | null = null;
+  let branch: string | null = null;
+  let locked = false;
+
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      wtPath = line.slice("worktree ".length).trim();
+    } else if (line.startsWith("HEAD ")) {
+      head = line.slice("HEAD ".length).trim();
+    } else if (line.startsWith("branch ")) {
+      const ref = line.slice("branch ".length).trim();
+      branch = ref.replace(/^refs\/heads\//, "");
+    } else if (line === "locked" || line.startsWith("locked ")) {
+      locked = true;
+    }
+  }
+
+  if (!wtPath) return null;
+
+  return { path: wtPath, branch, head, locked };
 }
 
 /** Default singleton wiring is left to the composition root (server bootstrap). */

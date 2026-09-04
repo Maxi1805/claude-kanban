@@ -89,13 +89,6 @@ function openTaskModal(): void {
           </button>
         </div>
 
-        <RouterLink
-          class="btn btn--ghost"
-          to="/db"
-          title="Ver la base de datos en vivo"
-        >
-          ⛁ BD
-        </RouterLink>
         <button class="btn btn--ghost" type="button" @click="newProject">
           + Proyecto
         </button>

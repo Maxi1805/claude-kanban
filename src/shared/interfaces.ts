@@ -9,11 +9,10 @@
 import type {
   AddRepoDTO,
   AgentState,
+  CavemanLevel,
   CommandKind,
   CreateProjectDTO,
   CreateTaskDTO,
-  DbOverviewResponse,
-  DbTableRowsResponse,
   FsInspectResponse,
   FsListResponse,
   FsRootsResponse,
@@ -21,7 +20,10 @@ import type {
   ProjectRepo,
   RunCommandResult,
   Task,
+  TaskCodeResponse,
   TaskRepo,
+  TaskSchemaRepo,
+  TaskSchemaResponse,
   TaskStatus,
   UpdateRepoDTO,
   UpdateTaskDTO,
@@ -257,6 +259,18 @@ export interface PtyService {
 
   /** Whether a live pty currently exists for the task. */
   has(taskId: string): boolean;
+
+  /**
+   * Epoch ms of the last byte written INTO the task's pty (user keystrokes and
+   * server-typed text alike), or undefined when nothing was ever written. Lets a
+   * caller hold off on typing while a human is mid-keystroke.
+   *
+   * OPTIONAL on the contract: it is an advisory clock, not a capability anything
+   * depends on. A consumer that cannot read it simply does not wait — so test
+   * doubles are free to omit it, and the one caller (caveman.ts) reads it with
+   * `?.` and treats "unknown" as "nobody is typing".
+   */
+  getLastInputAt?(taskId: string): number | undefined;
 
   /**
    * Milliseconds since this task's pty last produced OUTPUT — the per-task
@@ -508,51 +522,92 @@ export interface TaskLifecycle {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
- * DbViewerService — read-only live inspection of the app's sqlite database.
- *   Owner module: db-viewer
+ * SchemaInspectorService — the DECLARED schema of a task, per repo.
+ *   Owner module: schema-inspector
  * ──────────────────────────────────────────────────────────────────────── */
 
-/** Raised for an unknown table name (the router maps it to a 404). */
-export class DbViewerError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "DbViewerError";
-  }
+/**
+ * Reads the schema a task's worktrees declare IN THEIR FILES and diffs it
+ * against each repo's base branch, so the diagram shows what this task adds.
+ *
+ * No database is ever opened, and no stack is built in: each repo's schema is
+ * produced by an extractor script that a Claude Code agent wrote for that repo
+ * after reading its code. Per-repo failures are reported inside the response
+ * rather than thrown, so one broken repo never blanks the whole view.
+ */
+export interface SchemaInspectorService {
+  /**
+   * Inspect every repo of a task. Throws only when the task itself is unknown
+   * (the router maps that to a 404).
+   */
+  forTask(taskId: string): Promise<TaskSchemaResponse>;
+
+  /**
+   * Have an agent (re)write the extractor for one repo of a task, validate it
+   * by running it, and return that repo's freshly inspected state. Rejects a
+   * script that does not produce the contract, keeping the previous one.
+   */
+  generateForRepo(taskId: string, repoName: string): Promise<TaskSchemaRepo>;
+
+  /** Drop a repo's extractor, so the diagram asks to generate one again. */
+  deleteForRepo(taskId: string, repoName: string): Promise<void>;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * CodeInspectorService — refactor hotspots for a task's repos.
+ *   Owner module: code-inspector
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * P3 — the page of GROUPS to serve, over the ranking `code-analyzer.ts`
+ * already computed (score-sorted; shape mirrors `AnalyzeLimits`). Both
+ * optional: absent `offset` ⇒ 0 (page 1).
+ *
+ * OLA BA, FRENTE BA1 — absent `limit` ⇒ `"unlimited"`: TODO lo guardado, en una
+ * sola respuesta (antes: 200). El corte era de servido, no de análisis, y el
+ * panel nunca mostraba el total por default. Sigue acotado por
+ * `MAX_STORED_FINDINGS` (`code-analyzer.ts`), nunca por este tipo. Pedir un
+ * `limit` explícito sigue funcionando igual que siempre.
+ */
+export interface CodePageRequest {
+  readonly offset?: number;
+  readonly limit?: number | "unlimited";
 }
 
 /**
- * Read-only window onto the app's own sqlite file for the `/db` live viewer.
- * Backed by a SEPARATE read-only connection (never the app's writer), which is
- * also what makes change detection work: `PRAGMA data_version` only moves when
- * ANOTHER connection commits, so from this connection's viewpoint every app
- * write (and any external writer) bumps it. Everything is introspected via
- * sqlite_master + pragma table functions — no schema assumptions.
+ * Surfaces tree-sitter-detected refactor hotspots per repo of a task, each
+ * mapped to the design pattern that addresses it. Analysing a repo is
+ * CPU-bound (seconds, not milliseconds, on a large codebase) so it never runs
+ * inline: `forTask` reuses a cached analysis while the worktree is unchanged,
+ * and otherwise starts it in the BACKGROUND and answers immediately with
+ * `analyzing: true` — the same polling shape as {@link SchemaInspectorService}.
  */
-export interface DbViewerService {
-  /** Schema + row counts of every user table (sqlite_* internals excluded). */
-  overview(): DbOverviewResponse;
-
+export interface CodeInspectorService {
   /**
-   * One page of a table's rows. `name` must be an existing user table (checked
-   * against sqlite_master — never interpolated unvalidated) or
-   * {@link DbViewerError} is thrown. `limit` is clamped to a sane maximum.
+   * Inspect every repo of a task. Throws only when the task itself is unknown
+   * (the router maps that to a 404). Per-repo failures (an unreadable
+   * worktree, a parse error) land in that repo's `error` field instead.
+   *
+   * P3 — `page` slices the SAME cached full ranking every repo already has
+   * (see `code-inspector.ts`'s docstring: the analysis is always run/cached
+   * "unlimited" internally, up to `MAX_STORED_FINDINGS`, precisely so a page
+   * request never costs a re-analysis). OLA BA: absent ⇒ TODO lo guardado, sin
+   * cortar (ver {@link CodePageRequest}).
    */
-  tableRows(
-    name: string,
-    opts?: { limit?: number; offset?: number },
-  ): DbTableRowsResponse;
-
+  forTask(taskId: string, page?: CodePageRequest): Promise<TaskCodeResponse>;
   /**
-   * Start polling `PRAGMA data_version` and broadcasting a `db:changed` frame
-   * whenever it moved. Idempotent; the interval never holds the process open.
+   * Discard a finding with a reason — F2. Persists by
+   * (repo, stable id), so it stays discarded across a re-analysis and across
+   * every future task on the same repo. Throws for an unknown task/repo.
    */
-  start(): void;
-
-  /** Stop polling (idempotent). */
-  stop(): void;
-
-  /** Close the underlying read-only connection (stops polling first). */
-  close(): void;
+  discardCodeFinding(
+    taskId: string,
+    repoName: string,
+    findingId: string,
+    reason: string,
+  ): Promise<void>;
+  /** Undo a discard — F2. A no-op if it was not discarded. Throws for an unknown task/repo. */
+  restoreCodeFinding(taskId: string, repoName: string, findingId: string): Promise<void>;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -574,6 +629,12 @@ export interface TaskPatch {
   agentState?: AgentState | null;
   /** ISO-8601 timestamp of the last agentState transition. */
   agentStateAt?: string | null;
+  /** Whether the caveman plugin is loaded into this task's session. */
+  cavemanEnabled?: boolean;
+  /** Compression level used when caveman is enabled; retained while disabled. */
+  cavemanLevel?: CavemanLevel | null;
+  /** What the live session was spawned with; written at spawn, never by the UI. */
+  cavemanSession?: boolean | null;
 }
 
 /** Persistence for projects. */
@@ -615,7 +676,7 @@ export interface ProjectRepoRepository {
 export interface TaskRepository {
   create(
     fields: Pick<Task, "projectId" | "title" | "description" | "slug"> &
-      Partial<Pick<Task, "status">>,
+      Partial<Pick<Task, "status" | "cavemanEnabled" | "cavemanLevel">>,
   ): Task;
   getById(id: string, opts?: { withRepos?: boolean }): Task | null;
   /** Tasks for a project (or all when omitted), optionally hydrated with repos. */

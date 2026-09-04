@@ -12,13 +12,24 @@
  */
 import { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
-import type { Repositories, TaskLifecycle } from "../../shared/interfaces.js";
 import type {
+  PtyService,
+  Repositories,
+  TaskLifecycle,
+} from "../../shared/interfaces.js";
+import type {
+  CavemanLevel,
   CreateTaskDTO,
   Task,
   TaskStatus,
   UpdateTaskDTO,
 } from "../../shared/types.js";
+import { CAVEMAN_LEVELS, cavemanPending } from "../../shared/types.js";
+import {
+  applyCavemanToLiveSession,
+  DEFAULT_SUBMIT_TIMING,
+  type SubmitTiming,
+} from "../services/caveman.js";
 import type { BoardEventEmitter } from "./projects.js";
 
 const TASK_STATUSES: readonly TaskStatus[] = [
@@ -32,6 +43,18 @@ export interface TasksRouterDeps {
   repos: Repositories;
   lifecycle: TaskLifecycle;
   emit?: BoardEventEmitter;
+  /**
+   * Pty service used to push a caveman change into a task's LIVE session.
+   * Optional: without it the setting is still persisted and applies on the next
+   * spawn — the route never fails over a missing pty.
+   */
+  pty?: PtyService;
+  /**
+   * Timings for typing into that live session (see caveman.ts). Injectable so
+   * tests can compress the wait-for-quiet to milliseconds; production uses the
+   * defaults.
+   */
+  cavemanTiming?: SubmitTiming;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -42,6 +65,170 @@ function isTaskStatus(value: unknown): value is TaskStatus {
   return (
     typeof value === "string" && (TASK_STATUSES as readonly string[]).includes(value)
   );
+}
+
+function isCavemanLevel(value: unknown): value is CavemanLevel {
+  return (
+    typeof value === "string" &&
+    (CAVEMAN_LEVELS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Whether a patch actually changed what the live session should be told. A level
+ * change while caveman is OFF changes nothing the session can act on, so it is
+ * persisted silently — editing an unchecked selector must never type into a
+ * running agent.
+ *
+ * Whether the session can act on it AT ALL is a separate question, answered by
+ * `sessionHasPlugin` inside {@link applyCavemanToLiveSession}: a session spawned
+ * without the plugin cannot be talked into having it.
+ */
+function cavemanChanged(before: Task, after: Task): boolean {
+  if (before.cavemanEnabled !== after.cavemanEnabled) return true;
+  return after.cavemanEnabled && before.cavemanLevel !== after.cavemanLevel;
+}
+
+/**
+ * Validate a CreateTaskDTO from an untyped request body. Pure — it neither
+ * reads the repositories nor writes anything; the route turns the first
+ * `{ error }` into a 400, and only then looks the project up and calls the
+ * lifecycle.
+ */
+function parseCreateTaskDTO(body: unknown): CreateTaskDTO | { error: string } {
+  if (typeof body !== "object" || body === null) {
+    return { error: "Request body must be an object" };
+  }
+  const b = body as Record<string, unknown>;
+
+  if (!isNonEmptyString(b.projectId)) {
+    return { error: "`projectId` is required and must be a non-empty string" };
+  }
+  if (!isNonEmptyString(b.title)) {
+    return { error: "`title` is required and must be a non-empty string" };
+  }
+  if (
+    b.description !== undefined &&
+    b.description !== null &&
+    typeof b.description !== "string"
+  ) {
+    return { error: "`description` must be a string or null" };
+  }
+  if (b.slug !== undefined && !isNonEmptyString(b.slug)) {
+    return { error: "`slug` must be a non-empty string" };
+  }
+  if (b.projectRepoIds !== undefined) {
+    if (
+      !Array.isArray(b.projectRepoIds) ||
+      !b.projectRepoIds.every((v) => typeof v === "string")
+    ) {
+      return { error: "`projectRepoIds` must be an array of strings" };
+    }
+  }
+  if (b.cavemanEnabled !== undefined && typeof b.cavemanEnabled !== "boolean") {
+    return { error: "`cavemanEnabled` must be a boolean" };
+  }
+  if (b.cavemanLevel !== undefined && !isCavemanLevel(b.cavemanLevel)) {
+    return {
+      error: `\`cavemanLevel\` must be one of: ${CAVEMAN_LEVELS.join(", ")}`,
+    };
+  }
+
+  return {
+    projectId: b.projectId,
+    title: b.title,
+    description: (b.description as string | null | undefined) ?? null,
+    slug: b.slug as string | undefined,
+    projectRepoIds: b.projectRepoIds as string[] | undefined,
+    cavemanEnabled: b.cavemanEnabled as boolean | undefined,
+    cavemanLevel: b.cavemanLevel as CavemanLevel | undefined,
+  };
+}
+
+/**
+ * Validate a task patch from an untyped body. Only the fields actually sent are
+ * carried into the patch; a body that sets none of them yields an empty patch
+ * (a no-op update that still returns the task).
+ */
+function parseUpdateTaskDTO(body: unknown): UpdateTaskDTO | { error: string } {
+  if (typeof body !== "object" || body === null) {
+    return { error: "Request body must be an object" };
+  }
+  const b = body as Record<string, unknown>;
+  const patch: UpdateTaskDTO = {};
+
+  if (b.title !== undefined) {
+    if (!isNonEmptyString(b.title)) {
+      return { error: "`title` must be a non-empty string" };
+    }
+    patch.title = b.title;
+  }
+  if (b.description !== undefined) {
+    if (b.description !== null && typeof b.description !== "string") {
+      return { error: "`description` must be a string or null" };
+    }
+    patch.description = b.description as string | null;
+  }
+  if (b.status !== undefined) {
+    if (!isTaskStatus(b.status)) {
+      return {
+        error: `\`status\` must be one of: ${TASK_STATUSES.join(", ")}`,
+      };
+    }
+    patch.status = b.status;
+  }
+  if (b.cavemanEnabled !== undefined) {
+    if (typeof b.cavemanEnabled !== "boolean") {
+      return { error: "`cavemanEnabled` must be a boolean" };
+    }
+    patch.cavemanEnabled = b.cavemanEnabled;
+  }
+  if (b.cavemanLevel !== undefined) {
+    if (!isCavemanLevel(b.cavemanLevel)) {
+      return {
+        error: `\`cavemanLevel\` must be one of: ${CAVEMAN_LEVELS.join(", ")}`,
+      };
+    }
+    patch.cavemanLevel = b.cavemanLevel;
+  }
+
+  return patch;
+}
+
+/**
+ * Push a persisted caveman change out to the task's RUNNING session, when there
+ * is one and when the change is something a session can act on. Fire-and-forget
+ * by design: typing into the pty first waits for the terminal to go quiet —
+ * seconds, potentially — and the board must get its updated task immediately.
+ * With no live pty this is a no-op and the setting simply applies at the next
+ * spawn.
+ */
+function propagateCavemanChange(
+  deps: TasksRouterDeps,
+  before: Task,
+  after: Task,
+): void {
+  if (!cavemanChanged(before, after)) return;
+
+  void applyCavemanToLiveSession(
+    deps.pty,
+    after,
+    deps.cavemanTiming ?? DEFAULT_SUBMIT_TIMING,
+  ).catch((err: unknown) => {
+    console.error(`[tasks] failed to apply caveman to ${after.id}:`, err);
+  });
+
+  // Turning caveman ON cannot reach a session that started without the plugin —
+  // only a respawn loads it. Rather than make the user ask for that separately,
+  // do it here: kill the pty, and the terminal's reconnect revives it with
+  // `--continue`, so the conversation carries on with the plugin loaded.
+  //
+  // EXCEPT while the agent is WORKING. Then the respawn would cut the turn it is
+  // in the middle of, which is never worth doing behind the user's back — the
+  // board leaves it pending and offers the restart as a button.
+  if (cavemanPending(after) && after.agentState !== "working") {
+    deps.pty?.kill(after.id);
+  }
 }
 
 export function createTasksRouter(deps: TasksRouterDeps): Router {
@@ -65,63 +252,15 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
 
   /* POST /api/tasks — delegates to TaskLifecycle.createTask. */
   router.post("/", async (req: Request, res: Response, next: NextFunction) => {
-    const body = req.body as unknown;
-    if (typeof body !== "object" || body === null) {
-      res.status(400).json({ error: "Request body must be an object" });
+    const dto = parseCreateTaskDTO(req.body);
+    if ("error" in dto) {
+      res.status(400).json({ error: dto.error });
       return;
     }
-    const b = body as Record<string, unknown>;
-
-    if (!isNonEmptyString(b.projectId)) {
-      res
-        .status(400)
-        .json({ error: "`projectId` is required and must be a non-empty string" });
-      return;
-    }
-    if (!isNonEmptyString(b.title)) {
-      res
-        .status(400)
-        .json({ error: "`title` is required and must be a non-empty string" });
-      return;
-    }
-    if (
-      b.description !== undefined &&
-      b.description !== null &&
-      typeof b.description !== "string"
-    ) {
-      res.status(400).json({ error: "`description` must be a string or null" });
-      return;
-    }
-    if (b.slug !== undefined && !isNonEmptyString(b.slug)) {
-      res.status(400).json({ error: "`slug` must be a non-empty string" });
-      return;
-    }
-    if (b.projectRepoIds !== undefined) {
-      if (
-        !Array.isArray(b.projectRepoIds) ||
-        !b.projectRepoIds.every((v) => typeof v === "string")
-      ) {
-        res
-          .status(400)
-          .json({ error: "`projectRepoIds` must be an array of strings" });
-        return;
-      }
-    }
-
-    const project = repos.projects.getById(b.projectId);
-    if (!project) {
+    if (!repos.projects.getById(dto.projectId)) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
-
-    const dto: CreateTaskDTO = {
-      projectId: b.projectId,
-      title: b.title,
-      description: (b.description as string | null | undefined) ?? null,
-      slug: b.slug as string | undefined,
-      projectRepoIds: b.projectRepoIds as string[] | undefined,
-    };
-
     try {
       const task = await lifecycle.createTask(dto);
       emit({ kind: "task:created", taskId: task.id, projectId: task.projectId, task });
@@ -143,36 +282,10 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
 
   /* PATCH /api/tasks/:id — title/description/status. */
   router.patch("/:id", (req: Request, res: Response) => {
-    const body = req.body as unknown;
-    if (typeof body !== "object" || body === null) {
-      res.status(400).json({ error: "Request body must be an object" });
+    const patch = parseUpdateTaskDTO(req.body);
+    if ("error" in patch) {
+      res.status(400).json({ error: patch.error });
       return;
-    }
-    const b = body as Record<string, unknown>;
-    const patch: UpdateTaskDTO = {};
-
-    if (b.title !== undefined) {
-      if (!isNonEmptyString(b.title)) {
-        res.status(400).json({ error: "`title` must be a non-empty string" });
-        return;
-      }
-      patch.title = b.title;
-    }
-    if (b.description !== undefined) {
-      if (b.description !== null && typeof b.description !== "string") {
-        res.status(400).json({ error: "`description` must be a string or null" });
-        return;
-      }
-      patch.description = b.description as string | null;
-    }
-    if (b.status !== undefined) {
-      if (!isTaskStatus(b.status)) {
-        res.status(400).json({
-          error: `\`status\` must be one of: ${TASK_STATUSES.join(", ")}`,
-        });
-        return;
-      }
-      patch.status = b.status;
     }
 
     const existing = repos.tasks.getById(req.params.id);
@@ -191,6 +304,9 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
     }
 
     const task: Task = repos.tasks.getById(updated.id, { withRepos: true }) ?? updated;
+
+    propagateCavemanChange(deps, existing, task);
+
     emit({
       kind: statusChanged ? "task:status" : "task:updated",
       taskId: task.id,
@@ -198,6 +314,27 @@ export function createTasksRouter(deps: TasksRouterDeps): Router {
       task,
     });
     res.json(task);
+  });
+
+  /* POST /api/tasks/:id/agent/restart — restart the task's agent in place.
+   *
+   * Kills the pty. The terminal's socket is closed by the bridge on exit and the
+   * client reconnects, and every reconnect runs `ensureAgent` — which respawns
+   * with the resume args (`claude --continue`), so the conversation carries over.
+   * The respawn writes a FRESH settings file, which is the only way a caveman
+   * checkbox toggled mid-session can take effect.
+   *
+   * A task with no live pty is a no-op success: its next spawn already picks the
+   * new setting up. */
+  router.post("/:id/agent/restart", (req: Request, res: Response) => {
+    const task = repos.tasks.getById(req.params.id, { withRepos: true });
+    if (!task) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+    const wasLive = deps.pty?.has(task.id) === true;
+    if (wasLive) deps.pty?.kill(task.id);
+    res.json({ task, restarted: wasLive });
   });
 
   /* DELETE /api/tasks/:id — delegates to TaskLifecycle.deleteTask (teardown). */

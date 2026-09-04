@@ -7,6 +7,7 @@
 import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useBoardStore } from "@/store";
+import CavemanToggle from "./CavemanToggle.vue";
 import type { AgentState, Task, TaskStatus } from "@/types";
 
 const props = defineProps<{ task: Task }>();
@@ -106,6 +107,11 @@ async function onDelete(): Promise<void> {
     </header>
 
     <p v-if="task.description" class="task-card__desc">{{ task.description }}</p>
+
+    <!-- Token-saving switch for THIS task's session. Its own row so the footer
+         keeps reading as repos + state, and so the control never competes with
+         the card's click-to-open. -->
+    <CavemanToggle :task="task" compact />
 
     <footer class="task-card__foot">
       <ul v-if="repoNames.length" class="task-card__repos">

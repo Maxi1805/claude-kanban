@@ -61,8 +61,16 @@ class FakePtyService implements PtyService {
   has(_taskId: string): boolean {
     return true;
   }
-  write(): void {}
-  resize(): void {}
+  /** Recorded client → server keystrokes, in order. */
+  writes: string[] = [];
+  /** Recorded client → server geometry changes, in order. */
+  resizes: Array<{ cols: number; rows: number }> = [];
+  write(_taskId: string, data: string): void {
+    this.writes.push(data);
+  }
+  resize(_taskId: string, cols: number, rows: number): void {
+    this.resizes.push({ cols, rows });
+  }
   kill(): void {}
   onData(_taskId: string, cb: PtyDataListener): Unsubscribe {
     this.dataListeners.add(cb);
@@ -141,6 +149,11 @@ class FakeWebSocket {
   }
   on(event: string, cb: (arg: unknown) => void): void {
     this.handlers.set(event, cb);
+  }
+
+  /** Deliver one raw client → server frame to the bridge's `message` handler. */
+  emitMessage(raw: string): void {
+    this.handlers.get("message")?.(raw);
   }
 
   /** Frames of a given type, in order. */
@@ -410,5 +423,63 @@ describe("pty-bridge attach: ensureAgent on connect (resume a dead task)", () =>
 
     // Even though the hook rejected, the bridge still replays history.
     expect(ws.outputs()).toEqual(["FALLBACK"]);
+  });
+});
+
+/**
+ * Client → server frames. The bridge accepts exactly two (`pty:input`,
+ * `pty:resize`) and must SILENTLY ignore everything else — a malformed or
+ * hostile frame can never be allowed to tear down a live terminal.
+ */
+describe("pty-bridge attach: input + resize", () => {
+  it("forwards pty:input keystrokes to the pty", () => {
+    const svc = new FakePtyService();
+    const ws = new FakeWebSocket();
+    attachFake(ws, TID, svc);
+
+    ws.emitMessage(JSON.stringify({ type: "pty:input", data: "ls -la\r" }));
+
+    expect(svc.writes).toEqual(["ls -la\r"]);
+  });
+
+  it("ignores a pty:input whose payload is not a string", () => {
+    const svc = new FakePtyService();
+    const ws = new FakeWebSocket();
+    attachFake(ws, TID, svc);
+
+    ws.emitMessage(JSON.stringify({ type: "pty:input", data: 42 }));
+
+    expect(svc.writes).toEqual([]);
+  });
+
+  it("forwards a valid pty:resize and ignores invalid geometry", () => {
+    const svc = new FakePtyService();
+    const ws = new FakeWebSocket();
+    attachFake(ws, TID, svc);
+
+    ws.emitMessage(JSON.stringify({ type: "pty:resize", cols: 120, rows: 40 }));
+    // Zero, negative and non-finite dimensions are all rejected.
+    ws.emitMessage(JSON.stringify({ type: "pty:resize", cols: 0, rows: 40 }));
+    ws.emitMessage(JSON.stringify({ type: "pty:resize", cols: 80, rows: -1 }));
+    ws.emitMessage(JSON.stringify({ type: "pty:resize", cols: "x", rows: 40 }));
+
+    expect(svc.resizes).toEqual([{ cols: 120, rows: 40 }]);
+  });
+
+  it("ignores malformed JSON and server-originated frames without throwing", () => {
+    const svc = new FakePtyService();
+    const ws = new FakeWebSocket();
+    attachFake(ws, TID, svc);
+
+    expect(() => ws.emitMessage("{not json")).not.toThrow();
+    // pty:output / pty:exit are server → client; echoing them back is a no-op.
+    ws.emitMessage(JSON.stringify({ type: "pty:output", taskId: TID, data: "X" }));
+    ws.emitMessage(
+      JSON.stringify({ type: "pty:exit", taskId: TID, exitCode: 0, signal: null }),
+    );
+
+    expect(svc.writes).toEqual([]);
+    expect(svc.resizes).toEqual([]);
+    expect(ws.closed).toBeNull();
   });
 });

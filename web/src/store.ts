@@ -9,6 +9,7 @@
 import { defineStore } from "pinia";
 import { api as apiClient, eventsWsUrl } from "@/api/client";
 import type {
+  CavemanLevel,
   Project,
   Task,
   TaskStatus,
@@ -232,6 +233,49 @@ export const useBoardStore = defineStore("board", {
         this.upsertTask(updated);
       } catch (err) {
         task.status = previous; // rollback
+        this.error = errorMessage(err);
+        throw err;
+      }
+    },
+
+    /**
+     * Toggle the caveman plugin for a task, or switch its compression level.
+     * Optimistic like {@link moveTask}: the checkbox/selector reacts instantly
+     * and rolls back if the server rejects it. The BACKEND is what reaches the
+     * running session — it types the plugin's command into that task's pty — so
+     * there is nothing to await here beyond the persisted row.
+     */
+    async setCaveman(
+      taskId: string,
+      patch: { cavemanEnabled?: boolean; cavemanLevel?: CavemanLevel },
+    ): Promise<void> {
+      const task = this.tasks.find((t) => t.id === taskId);
+      if (!task) return;
+      const previous = {
+        cavemanEnabled: task.cavemanEnabled,
+        cavemanLevel: task.cavemanLevel,
+      };
+      Object.assign(task, patch);
+      try {
+        const updated = await api.updateTask(taskId, patch);
+        this.upsertTask(updated);
+      } catch (err) {
+        Object.assign(task, previous); // rollback
+        this.error = errorMessage(err);
+        throw err;
+      }
+    },
+
+    /**
+     * Restart a task's agent so a pending caveman change lands. The backend
+     * kills the pty; the terminal reconnects and revives it with `--continue`,
+     * and the respawn is what re-reads the plugin settings.
+     */
+    async restartAgent(taskId: string): Promise<void> {
+      try {
+        const { task } = await api.restartAgent(taskId);
+        this.upsertTask(task);
+      } catch (err) {
         this.error = errorMessage(err);
         throw err;
       }

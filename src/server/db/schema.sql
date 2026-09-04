@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   port               INTEGER,
   agent_state        TEXT,
   agent_state_at     TEXT,
+  caveman_enabled    INTEGER NOT NULL DEFAULT 0,
+  caveman_level      TEXT,
+  caveman_session    INTEGER,
   created_at         TEXT NOT NULL,
   updated_at         TEXT NOT NULL
 );
@@ -54,3 +57,15 @@ CREATE TABLE IF NOT EXISTS task_repos (
 CREATE INDEX IF NOT EXISTS idx_project_repos_project ON project_repos(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project         ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_task_repos_task        ON task_repos(task_id);
+
+-- OLA BC, FRENTE BC1 — LAS TRES TABLAS DEL MOTOR (`code_file_facts`,
+-- `code_finding_decisions`, `code_graphs`) YA NO SE DECLARAN ACÁ. Viven en
+-- `src/server/services/engine/schema.sql` y las aplica `ensureEngineSchema`,
+-- que `db/index.ts` llama justo después de ejecutar este archivo — el
+-- resultado sobre la base es idéntico al de antes de esta ola.
+--
+-- POR QUÉ SE MOVIERON. No tienen ni una clave foránea a `tasks`/`projects`:
+-- `repo_key` es TEXT opaco. Son el almacenamiento del ANALIZADOR, y el
+-- analizador tiene que poder arrancar contra una conexión que el tablero no
+-- abrió (ver `engine/index.ts`). Dejar el DDL en dos lugares habría dejado
+-- dos verdades que se separan en silencio; hay UNA sola, la del motor.
